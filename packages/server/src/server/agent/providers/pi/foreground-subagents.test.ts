@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 
-import { PiForegroundSubagentIndex } from "./foreground-subagents.js";
+import { PiForegroundSubagentIndex, readPiAsyncSubagentRun } from "./foreground-subagents.js";
 import { parseToolArgs, parseToolResult } from "./tool-call-mapper.js";
 
 describe("PiForegroundSubagentIndex", () => {
@@ -151,6 +151,37 @@ describe("PiForegroundSubagentIndex", () => {
     });
 
     expect(index.handle("parent-tool", toolCall, "running", null)).toEqual([]);
+  });
+
+  test("reads the artifact location from an asynchronous launch result", () => {
+    const toolCall = parseToolArgs("subagent", {
+      agent: "delegate",
+      task: "Inspect the adapter",
+      model: "github-copilot/gemini-3.7-flash",
+    });
+
+    expect(
+      readPiAsyncSubagentRun(
+        "parent-tool",
+        toolCall,
+        parseToolResult({
+          details: {
+            mode: "workflow",
+            runId: "run-1",
+            asyncId: "run-1",
+            asyncDir: "/tmp/run-1",
+            results: [],
+          },
+        }),
+      ),
+    ).toEqual({
+      id: "run-1",
+      asyncDir: "/tmp/run-1",
+      title: "delegate",
+      description: "Inspect the adapter",
+      subtitle: "github-copilot/gemini-3.7-flash",
+      toolCallId: "parent-tool",
+    });
   });
 
   test("marks any nonzero child exit code as failed", () => {

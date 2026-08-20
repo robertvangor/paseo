@@ -77,7 +77,7 @@ import type {
   PiThinkingLevel,
 } from "./rpc-types.js";
 import { PiUsagePoller, type PiUsagePollScheduler } from "./usage-poller.js";
-import { PiForegroundSubagentIndex } from "./foreground-subagents.js";
+import { PiForegroundSubagentIndex, readPiAsyncSubagentRun } from "./foreground-subagents.js";
 import { PiSubagentTimelineBridge } from "./subagent-timeline.js";
 import {
   mapToolDetail,
@@ -2005,6 +2005,9 @@ export class PiRpcAgentSession implements AgentSession {
     const description = optionalString(payload.description)?.trim();
     const cwd = optionalString(payload.cwd)?.trim();
     const asyncDir = optionalString(payload.asyncDir)?.trim();
+    if (status !== "running" && this.subagentTimelineBridge.complete(id)) {
+      return true;
+    }
     this.emit({
       type: "provider_subagent",
       provider: this.provider,
@@ -2019,8 +2022,6 @@ export class PiRpcAgentSession implements AgentSession {
     });
     if (status === "running" && asyncDir) {
       this.subagentTimelineBridge.observe(id, asyncDir);
-    } else if (status !== "running") {
-      this.subagentTimelineBridge.complete(id);
     }
     return true;
   }
@@ -2375,8 +2376,26 @@ export class PiRpcAgentSession implements AgentSession {
     error: unknown,
   ): boolean {
     const turnId = this.currentTurnIdForEvent();
+    const asyncRun = readPiAsyncSubagentRun(toolCallId, toolCall, result);
     for (const event of this.foregroundSubagents.handle(toolCallId, toolCall, status, result)) {
       this.emit(event);
+    }
+    if (asyncRun) {
+      this.emit({
+        type: "provider_subagent",
+        provider: this.provider,
+        event: {
+          type: "upsert",
+          id: asyncRun.id,
+          title: asyncRun.title,
+          ...(asyncRun.description ? { description: asyncRun.description } : {}),
+          status: "running",
+          toolCallId: asyncRun.toolCallId,
+          ...(asyncRun.cwd ? { cwd: asyncRun.cwd } : {}),
+          ...(asyncRun.subtitle ? { subtitle: asyncRun.subtitle } : {}),
+        },
+      });
+      this.subagentTimelineBridge.observe(asyncRun.id, asyncRun.asyncDir);
     }
     const detail = this.mapToolDetail(toolCallId, toolCall, result);
     if (!detail) {

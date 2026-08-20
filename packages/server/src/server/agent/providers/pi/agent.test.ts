@@ -706,6 +706,80 @@ describe("PiRpcAgentSession", () => {
     ]);
   });
 
+  test("connects detached subagent launch results to their artifact-backed timeline", async () => {
+    const { pi, session, events } = await createSession();
+    const fakeSession = pi.latestSession();
+
+    await session.startTurn("delegate this");
+    fakeSession.emit({
+      type: "tool_execution_start",
+      toolCallId: "launch-tool",
+      toolName: "subagent",
+      args: {
+        agent: "delegate",
+        task: "Inspect the adapter",
+        model: "github-copilot/gemini-3.7-flash",
+      },
+    });
+    fakeSession.emit({
+      type: "tool_execution_end",
+      toolCallId: "launch-tool",
+      toolName: "subagent",
+      result: {
+        content: [{ type: "text", text: "Async workflow [run-1]" }],
+        details: {
+          mode: "workflow",
+          runId: "run-1",
+          asyncId: "run-1",
+          asyncDir: "/tmp/paseo-pi-rpc-test/run-1",
+          results: [],
+        },
+      },
+      isError: false,
+    });
+    fakeSession.emit({
+      type: "extension_ui_request",
+      id: "subagent-completed",
+      method: "notify",
+      message: 'PASEO_PI_SUBAGENT {"id":"run-1","status":"completed"}',
+    });
+
+    expect(events.providerSubagentEvents()).toEqual([
+      {
+        type: "provider_subagent",
+        provider: "pi",
+        event: {
+          type: "upsert",
+          id: "launch-tool:0",
+          title: "delegate",
+          description: "Inspect the adapter",
+          status: "running",
+          toolCallId: "launch-tool",
+        },
+      },
+      {
+        type: "provider_subagent",
+        provider: "pi",
+        event: { type: "remove", id: "launch-tool:0" },
+      },
+      {
+        type: "provider_subagent",
+        provider: "pi",
+        event: {
+          type: "upsert",
+          id: "run-1",
+          title: "delegate",
+          description: "Inspect the adapter",
+          status: "running",
+          toolCallId: "launch-tool",
+          subtitle: "github-copilot/gemini-3.7-flash",
+        },
+      },
+    ]);
+
+    await session.close();
+  });
+
   test("keeps one generated message id when Pi omits message start and response id", async () => {
     const { pi, session, events } = await createSession();
     const fakeSession = pi.latestSession();

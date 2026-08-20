@@ -31,6 +31,16 @@ interface PiForegroundSubagentSnapshot {
   progress: Record<string, unknown>[];
 }
 
+export interface PiAsyncSubagentRun {
+  id: string;
+  asyncDir: string;
+  title: string;
+  description?: string;
+  subtitle?: string;
+  toolCallId: string;
+  cwd?: string;
+}
+
 export class PiForegroundSubagentIndex {
   private readonly states = new Map<string, Map<number, PiForegroundSubagentState>>();
   private readonly ignoredToolCalls = new Set<string>();
@@ -200,6 +210,31 @@ export class PiForegroundSubagentIndex {
         ]
       : [];
   }
+}
+
+export function readPiAsyncSubagentRun(
+  toolCallId: string,
+  toolCall: PiTrackedToolCall,
+  result: PiToolResult,
+): PiAsyncSubagentRun | null {
+  if (!isSubagentExecution(toolCall)) return null;
+  const details = resultDetails(result);
+  const id = readString(details?.asyncId) ?? readString(details?.runId);
+  const asyncDir = readString(details?.asyncDir);
+  if (!id || !asyncDir) return null;
+  const args = isRecord(toolCall.args) ? toolCall.args : {};
+  const description = resolveDescription(args, undefined, undefined);
+  const subtitle = resolveSubtitle(args, details ?? undefined);
+  const cwd = readString(details?.cwd) ?? readString(args.cwd);
+  return {
+    id,
+    asyncDir,
+    title: resolveTitle(args, undefined, undefined),
+    ...(description ? { description } : {}),
+    ...(subtitle ? { subtitle } : {}),
+    toolCallId,
+    ...(cwd ? { cwd } : {}),
+  };
 }
 
 function providerEvent(
