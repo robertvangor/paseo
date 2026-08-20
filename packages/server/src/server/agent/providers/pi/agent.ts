@@ -77,6 +77,8 @@ import type {
   PiThinkingLevel,
 } from "./rpc-types.js";
 import { PiUsagePoller, type PiUsagePollScheduler } from "./usage-poller.js";
+import { PiForegroundSubagentIndex } from "./foreground-subagents.js";
+import { PiSubagentTimelineBridge } from "./subagent-timeline.js";
 import {
   mapToolDetail,
   parseToolArgs,
@@ -674,6 +676,7 @@ function createPiPaseoExtensionFile(systemPrompt?: string): PiTempFile {
 	    description,
 	    status: "running",
 	    cwd: typeof payload.cwd === "string" ? payload.cwd : undefined,
+	    asyncDir: typeof payload.asyncDir === "string" ? payload.asyncDir : undefined,
 	  });
 	}
 
@@ -1280,6 +1283,8 @@ export class PiRpcAgentSession implements AgentSession {
   private readonly currentModeId: string | null;
   private readonly logger: Logger;
   private readonly usagePoller: PiUsagePoller;
+  private readonly foregroundSubagents: PiForegroundSubagentIndex;
+  private readonly subagentTimelineBridge: PiSubagentTimelineBridge;
   private closed = false;
   // Pi reports an aborted OpenAI Responses stream before the abort RPC resolves.
   // Keep the turn active until that RPC acknowledges the user-requested cancellation.
@@ -1301,6 +1306,12 @@ export class PiRpcAgentSession implements AgentSession {
       null;
     this.extensionTimeoutMs = options.extensionTimeoutMs ?? DEFAULT_PI_EXTENSION_RESULT_TIMEOUT_MS;
     this.logger = options.logger;
+    this.foregroundSubagents = new PiForegroundSubagentIndex({ provider: this.provider });
+    this.subagentTimelineBridge = new PiSubagentTimelineBridge({
+      provider: this.provider,
+      emit: (event) => this.emit(event),
+      logger: this.logger,
+    });
     this.usagePoller = new PiUsagePoller({
       scheduler: options.usagePollScheduler,
       readStats: () => this.runtimeSession.getSessionStats(),
@@ -1517,6 +1528,7 @@ export class PiRpcAgentSession implements AgentSession {
         this.activeTurnStarted = false;
         this.activeAssistantMessageId = null;
         this.clearNoTurnBuffers();
+        for (const event of this.foregroundSubagents.terminalizeRunning("failed")) this.emit(event);
         this.emit({
           type: "turn_failed",
           provider: this.provider,
@@ -1533,6 +1545,7 @@ export class PiRpcAgentSession implements AgentSession {
       this.activeTurnStarted = false;
       this.activeAssistantMessageId = null;
       this.clearNoTurnBuffers();
+      for (const event of this.foregroundSubagents.terminalizeRunning("canceled")) this.emit(event);
       this.emit({
         type: "turn_canceled",
         provider: this.provider,
@@ -1566,6 +1579,7 @@ export class PiRpcAgentSession implements AgentSession {
     });
     this.currentLeafOverrideId = targetEntry.parentId;
     this.activeToolCalls.clear();
+    for (const event of this.foregroundSubagents.terminalizeRunning("canceled")) this.emit(event);
   }
 
   private async runPiTreeExtensionCommand(targetId: string): Promise<unknown> {
@@ -1582,6 +1596,8 @@ export class PiRpcAgentSession implements AgentSession {
     }
     this.closed = true;
     this.usagePoller.close();
+    this.subagentTimelineBridge.close();
+    for (const event of this.foregroundSubagents.terminalizeRunning("canceled")) this.emit(event);
     try {
       await this.runtimeSession.close();
     } finally {
@@ -1988,6 +2004,7 @@ export class PiRpcAgentSession implements AgentSession {
     const title = optionalString(payload.title)?.trim();
     const description = optionalString(payload.description)?.trim();
     const cwd = optionalString(payload.cwd)?.trim();
+    const asyncDir = optionalString(payload.asyncDir)?.trim();
     this.emit({
       type: "provider_subagent",
       provider: this.provider,
@@ -2000,6 +2017,11 @@ export class PiRpcAgentSession implements AgentSession {
         ...(cwd ? { cwd } : {}),
       },
     });
+    if (status === "running" && asyncDir) {
+      this.subagentTimelineBridge.observe(id, asyncDir);
+    } else if (status !== "running") {
+      this.subagentTimelineBridge.complete(id);
+    }
     return true;
   }
 
@@ -2133,6 +2155,7 @@ export class PiRpcAgentSession implements AgentSession {
 
   private handleProcessExit(error: string): void {
     this.rejectAllExtensionResults(new Error(error));
+    for (const event of this.foregroundSubagents.terminalizeRunning("failed")) this.emit(event);
     if (!this.activeTurnId) {
       return;
     }
@@ -2246,6 +2269,7 @@ export class PiRpcAgentSession implements AgentSession {
     const error = event.isError ? event.result : null;
     const status = event.isError ? "failed" : "completed";
     this.emitToolCallEvent(event.toolCallId, toolCall, status, result, error);
+    this.foregroundSubagents.clearToolCall(event.toolCallId);
   }
 
   private emitCompactionTimeline(input: {
@@ -2351,6 +2375,9 @@ export class PiRpcAgentSession implements AgentSession {
     error: unknown,
   ): boolean {
     const turnId = this.currentTurnIdForEvent();
+    for (const event of this.foregroundSubagents.handle(toolCallId, toolCall, status, result)) {
+      this.emit(event);
+    }
     const detail = this.mapToolDetail(toolCallId, toolCall, result);
     if (!detail) {
       return false;
@@ -2402,6 +2429,7 @@ export class PiRpcAgentSession implements AgentSession {
     this.clearNoTurnBuffers();
     const errorMessage = latestPiErrorMessage(messages);
     if (typeof errorMessage === "string" && errorMessage.length > 0) {
+      for (const event of this.foregroundSubagents.terminalizeRunning("failed")) this.emit(event);
       this.usagePoller.stopTurn();
       this.emit({
         type: "turn_failed",
@@ -2411,6 +2439,7 @@ export class PiRpcAgentSession implements AgentSession {
       });
       return;
     }
+    for (const event of this.foregroundSubagents.terminalizeRunning("canceled")) this.emit(event);
     const finalUsage = this.usagePoller.completeTurn(turnId);
     this.emit({
       type: "turn_completed",

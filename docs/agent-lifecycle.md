@@ -155,7 +155,9 @@ Provider descriptors may include one compact subtitle. The provider owns its con
 
 ### Pi provider subagents
 
-Pi's RPC stream does not expose extension event-bus messages. Paseo's injected Pi extension listens for `pi-subagents` async start and completion events and forwards them through the RPC extension-notification channel. Foreground subagents need no bridge because their tool call keeps the parent turn running.
+Pi's RPC stream does not expose extension event-bus messages. Paseo's injected Pi extension listens for `pi-subagents` async start and completion events and forwards the run identity and artifact directory through the RPC extension-notification channel. The daemon tails that run's structured `events.jsonl` artifact and maps completed child messages, reasoning, and tool calls into the read-only subagent timeline. It never scrapes terminal output.
+
+Foreground Pi children use the tool's structured progress and result payloads. Paseo opens a subagent row as soon as the tool starts, updates a live activity item while it runs, then maps the child's complete result messages into the same timeline. An explicitly asynchronous call uses only the artifact-backed path so it does not appear twice.
 
 ### Claude provider subagents: the task protocol
 

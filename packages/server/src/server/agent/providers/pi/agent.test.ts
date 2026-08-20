@@ -1114,6 +1114,7 @@ describe("PiRpcAgentSession", () => {
         agent: "reviewer",
         goal: "Review the change",
         cwd: "/workspace",
+        asyncDir: "/tmp/pi-subagents/run-1",
       }),
     );
     extensionEvents
@@ -1121,7 +1122,7 @@ describe("PiRpcAgentSession", () => {
       ?.forEach((listener) => listener({ runId: "run-1", state: "complete", success: true }));
 
     expect(notifications).toContain(
-      'PASEO_PI_SUBAGENT {"id":"run-1","title":"reviewer","description":"Review the change","status":"running","cwd":"/workspace"}',
+      'PASEO_PI_SUBAGENT {"id":"run-1","title":"reviewer","description":"Review the change","status":"running","cwd":"/workspace","asyncDir":"/tmp/pi-subagents/run-1"}',
     );
     expect(notifications).toContain('PASEO_PI_SUBAGENT {"id":"run-1","status":"completed"}');
 
