@@ -10,7 +10,6 @@ import type { PiAgentMessage } from "./rpc-types.js";
 const READ_BUFFER_BYTES = 64 * 1024;
 const DEFAULT_POLL_INTERVAL_MS = 250;
 const DEFAULT_TERMINAL_DRAIN_MS = 1_000;
-const STOP_SIGNAL_FALLBACK_DELAY_MS = 250;
 
 type PiSubagentTimelineLogger = Pick<Logger, "debug">;
 type PiSubagentStatus = "running" | "completed" | "failed" | "canceled";
@@ -40,7 +39,7 @@ export interface PiSubagentEventReaderOptions {
   emit: (event: AgentStreamEvent) => void;
   logger: PiSubagentTimelineLogger;
   contextWindowForModel?: (model: string) => number | undefined;
-  signalRunner?: (pid: number, signal: NodeJS.Signals) => void;
+  requestStop?: (runId: string, asyncDir: string) => Promise<void>;
 }
 
 export class PiSubagentEventReader {
@@ -63,7 +62,6 @@ export class PiSubagentEventReader {
   private closed = false;
   private terminal = false;
   private stopRequested = false;
-  private runnerPid: number | undefined;
 
   constructor(private readonly options: PiSubagentEventReaderOptions) {
     this.eventsPath = join(options.asyncDir, "events.jsonl");
@@ -113,39 +111,19 @@ export class PiSubagentEventReader {
       throw new Error("Pi subagent run is no longer running");
     }
     if (this.stopRequested) return;
-    await writeJsonFileAtomic(join(this.options.asyncDir, "control", "stop.json"), {
-      type: "stop",
-      ts: Date.now(),
-      source: "paseo",
-    });
+    if (this.options.requestStop) {
+      await this.options.requestStop(this.options.id, this.options.asyncDir);
+    } else {
+      await writeJsonFileAtomic(join(this.options.asyncDir, "control", "stop.json"), {
+        type: "stop",
+        ts: Date.now(),
+        source: "paseo",
+      });
+    }
     this.stopRequested = true;
     for (const [descriptorId, status] of this.statuses) {
       if (status === "running")
         this.emitDescriptor({ type: "upsert", id: descriptorId, canStop: false });
-    }
-    await new Promise((resolve) => setTimeout(resolve, STOP_SIGNAL_FALLBACK_DELAY_MS));
-    await this.readAvailable();
-    if (!this.terminal && this.runnerPid && this.runnerPid !== process.pid) {
-      try {
-        (this.options.signalRunner ?? signalPiRunner)(this.runnerPid, piInterruptSignal());
-        this.terminal = true;
-        for (const [descriptorId, status] of this.statuses) {
-          if (status !== "running") continue;
-          this.statuses.set(descriptorId, "canceled");
-          this.emitDescriptor({
-            type: "upsert",
-            id: descriptorId,
-            status: "canceled",
-            canStop: false,
-          });
-        }
-        this.closed = true;
-      } catch (error) {
-        this.options.logger.debug(
-          { err: error, pid: this.runnerPid, subagentId: this.options.id },
-          "Pi subagent stop fallback signal failed",
-        );
-      }
     }
   }
 
@@ -204,7 +182,6 @@ export class PiSubagentEventReader {
   }
 
   private consumeStatus(status: Record<string, unknown>): void {
-    this.runnerPid = readProcessId(status.pid);
     const lifecycle = statusValue(status.state);
     this.terminal = lifecycle !== "running";
     const steps = recordArray(status.steps);
@@ -456,6 +433,7 @@ interface PiSubagentTimelineBridgeOptions {
   emit: (event: AgentStreamEvent) => void;
   logger: PiSubagentTimelineLogger;
   contextWindowForModel?: (model: string) => number | undefined;
+  requestStop?: (runId: string, asyncDir: string) => Promise<void>;
   pollIntervalMs?: number;
   terminalDrainMs?: number;
 }
@@ -488,6 +466,7 @@ export class PiSubagentTimelineBridge {
       emit: this.options.emit,
       logger: this.options.logger,
       contextWindowForModel: this.options.contextWindowForModel,
+      requestStop: this.options.requestStop,
     });
     this.runs.set(id, { reader, terminalAt: null });
     void reader.readAvailable();
@@ -712,18 +691,6 @@ function formatCost(totalCostUsd: number | undefined): string | undefined {
 
 function readPositiveNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
-}
-
-function readProcessId(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : undefined;
-}
-
-function piInterruptSignal(): NodeJS.Signals {
-  return process.platform === "win32" ? "SIGBREAK" : "SIGUSR2";
-}
-
-function signalPiRunner(pid: number, signal: NodeJS.Signals): void {
-  process.kill(pid, signal);
 }
 
 function sumNumbers(...values: Array<number | undefined>): number | undefined {

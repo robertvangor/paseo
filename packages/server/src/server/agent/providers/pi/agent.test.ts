@@ -86,30 +86,36 @@ function readUtf8File(pathname: string): string {
 
 type PaseoExtensionListener = (event: unknown, context?: unknown) => unknown;
 type PaseoExtensionEventListener = (data: unknown) => void;
+type PaseoExtensionCommand = (args: string, context: unknown) => Promise<void>;
 
 async function loadPaseoExtensionListeners(
   extensionPath: string,
   extensionEventListeners = new Map<string, Set<PaseoExtensionEventListener>>(),
+  extensionCommands = new Map<string, PaseoExtensionCommand>(),
 ): Promise<Map<string, PaseoExtensionListener>> {
   const listeners = new Map<string, PaseoExtensionListener>();
   const extension = (await import(pathToFileURL(extensionPath).href)) as {
     default: (piApi: {
       on: (event: string, listener: PaseoExtensionListener) => void;
-      registerCommand: () => void;
+      registerCommand: (name: string, options: { handler: PaseoExtensionCommand }) => void;
       events: {
         on: (event: string, listener: PaseoExtensionEventListener) => () => void;
+        emit: (event: string, data: unknown) => void;
       };
     }) => void;
   };
   extension.default({
     on: (event, listener) => listeners.set(event, listener),
-    registerCommand: () => undefined,
+    registerCommand: (name, options) => extensionCommands.set(name, options.handler),
     events: {
       on: (event, listener) => {
         const eventListeners = extensionEventListeners.get(event) ?? new Set();
         eventListeners.add(listener);
         extensionEventListeners.set(event, eventListeners);
         return () => eventListeners.delete(listener);
+      },
+      emit: (event, data) => {
+        for (const listener of extensionEventListeners.get(event) ?? []) listener(data);
       },
     },
   });
@@ -1375,6 +1381,54 @@ describe("PiRpcAgentSession", () => {
       'PASEO_PI_SUBAGENT {"id":"run-1","title":"reviewer","description":"Review the change","status":"running","cwd":"/workspace","asyncDir":"/tmp/pi-subagents/run-1"}',
     );
     expect(notifications).toContain('PASEO_PI_SUBAGENT {"id":"run-1","status":"completed"}');
+
+    await session.close();
+  });
+
+  test("routes subagent stops through the Pi slash control bridge", async () => {
+    const pi = new FakePi();
+    const client = createClient(pi);
+    const session = await client.createSession(createConfig());
+    const extensionPath = pi.recordedLaunches[0]?.extensionPaths[0];
+    expect(extensionPath).toBeDefined();
+    const extensionEvents = new Map<string, Set<PaseoExtensionEventListener>>();
+    const extensionCommands = new Map<string, PaseoExtensionCommand>();
+    await loadPaseoExtensionListeners(extensionPath!, extensionEvents, extensionCommands);
+    const requests: unknown[] = [];
+    const requestListeners = new Set<PaseoExtensionEventListener>();
+    requestListeners.add((data) => {
+      requests.push(data);
+      const requestId = (data as { requestId: string }).requestId;
+      for (const listener of extensionEvents.get("subagent:slash:response") ?? []) {
+        listener({
+          requestId,
+          result: { content: [{ type: "text", text: "Stop requested." }] },
+          isError: false,
+        });
+      }
+    });
+    extensionEvents.set("subagent:slash:request", requestListeners);
+    const notifications: string[] = [];
+    const context = {
+      sessionManager: { getEntries: () => [] },
+      ui: { notify: (message: string) => notifications.push(message) },
+    };
+    const payload = Buffer.from(
+      JSON.stringify({ requestId: "stop-request", runId: "workflow-run" }),
+    ).toString("base64url");
+
+    await extensionCommands.get("paseo_stop_subagent")?.(payload, context);
+
+    expect(requests).toEqual([
+      {
+        requestId: "stop-request",
+        params: { action: "stop", runId: "workflow-run" },
+        ctx: context,
+      },
+    ]);
+    expect(notifications).toEqual([
+      'PASEO_COMMAND_RESULT {"requestId":"stop-request","ok":true,"result":{"content":[{"type":"text","text":"Stop requested."}]}}',
+    ]);
 
     await session.close();
   });

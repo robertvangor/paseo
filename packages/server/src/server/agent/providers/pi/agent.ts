@@ -97,6 +97,7 @@ const DEFAULT_PI_THINKING_LEVEL: PiThinkingLevel = "medium";
 const PI_BINARY_COMMAND = process.env.PI_COMMAND ?? process.env.PI_ACP_PI_COMMAND ?? "pi";
 const PASEO_PI_TREE_EXTENSION_COMMAND = "paseo_tree";
 const PASEO_PI_CAPTURE_EXTENSION_COMMAND = "paseo_capture_entries";
+const PASEO_PI_SUBAGENT_STOP_EXTENSION_COMMAND = "paseo_stop_subagent";
 const PASEO_PI_ENTRY_CAPTURE_MARKER = "PASEO_ENTRY_CAPTURE";
 const PASEO_PI_SUBMITTED_USER_ENTRY_MARKER = "PASEO_SUBMITTED_USER_ENTRY";
 const PASEO_PI_COMMAND_RESULT_MARKER = "PASEO_COMMAND_RESULT";
@@ -655,6 +656,38 @@ function createPiPaseoExtensionFile(systemPrompt?: string): PiTempFile {
 	  );
 	}
 
+	function requestSubagentStop(pi, ctx, requestId, runId) {
+	  return new Promise((resolve, reject) => {
+	    let settled = false;
+	    const finish = (callback) => {
+	      if (settled) return;
+	      settled = true;
+	      clearTimeout(timer);
+	      unsubscribe?.();
+	      callback();
+	    };
+	    const timer = setTimeout(() => {
+	      finish(() => reject(new Error("Pi subagent control bridge did not respond.")));
+	    }, 15_000);
+	    const unsubscribe = pi.events.on("subagent:slash:response", (response) => {
+	      if (!response || response.requestId !== requestId) return;
+	      if (response.isError) {
+	        const message = typeof response.errorText === "string" && response.errorText
+	          ? response.errorText
+	          : readTextContent(response.result?.content) || "Pi subagent stop failed.";
+	        finish(() => reject(new Error(message)));
+	        return;
+	      }
+	      finish(() => resolve(response.result));
+	    });
+	    pi.events.emit("subagent:slash:request", {
+	      requestId,
+	      params: { action: "stop", runId },
+	      ctx,
+	    });
+	  });
+	}
+
 	function subagentId(payload) {
 	  const value = payload && (payload.runId || payload.id);
 	  return typeof value === "string" && value ? value : undefined;
@@ -783,6 +816,24 @@ function createPiPaseoExtensionFile(systemPrompt?: string): PiTempFile {
 	      try {
 	        const result = await ctx.navigateTree(payload.targetId, { summarize: false });
 	        emitEntryCapture(ctx, "tree_navigation");
+	        emitCommandResult(ctx, payload.requestId, { ok: true, result });
+	      } catch (error) {
+	        const message = error instanceof Error ? error.message : String(error);
+	        emitCommandResult(ctx, payload.requestId, { ok: false, error: message });
+	        throw error;
+	      }
+	    },
+	  });
+
+	  pi.registerCommand("${PASEO_PI_SUBAGENT_STOP_EXTENSION_COMMAND}", {
+	    description: "Internal Paseo subagent stop bridge",
+	    handler: async (args, ctx) => {
+	      const payload = decodePayload(args.trim());
+	      try {
+	        if (typeof payload.runId !== "string" || !payload.runId) {
+	          throw new Error("Pi subagent stop requires a run ID.");
+	        }
+	        const result = await requestSubagentStop(pi, ctx, payload.requestId, payload.runId);
 	        emitCommandResult(ctx, payload.requestId, { ok: true, result });
 	      } catch (error) {
 	        const message = error instanceof Error ? error.message : String(error);
@@ -1329,6 +1380,7 @@ export class PiRpcAgentSession implements AgentSession {
       emit: (event) => this.emit(event),
       logger: this.logger,
       contextWindowForModel: (model) => this.subagentContextWindow(model),
+      requestStop: (runId) => this.runPiSubagentStopExtensionCommand(runId),
     });
     this.usagePoller = new PiUsagePoller({
       scheduler: options.usagePollScheduler,
@@ -1610,6 +1662,14 @@ export class PiRpcAgentSession implements AgentSession {
     const payload = Buffer.from(JSON.stringify({ targetId, requestId })).toString("base64url");
     await this.runtimeSession.prompt(`/${PASEO_PI_TREE_EXTENSION_COMMAND} ${payload}`);
     return await resultPromise;
+  }
+
+  private async runPiSubagentStopExtensionCommand(runId: string): Promise<void> {
+    const requestId = randomUUID();
+    const resultPromise = this.waitForExtensionResult(requestId);
+    const payload = Buffer.from(JSON.stringify({ requestId, runId })).toString("base64url");
+    await this.runtimeSession.prompt(`/${PASEO_PI_SUBAGENT_STOP_EXTENSION_COMMAND} ${payload}`);
+    await resultPromise;
   }
 
   async stopProviderSubagent(subagentId: string): Promise<void> {

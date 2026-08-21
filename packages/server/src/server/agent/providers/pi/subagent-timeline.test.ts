@@ -1,4 +1,11 @@
-import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Logger } from "pino";
@@ -246,7 +253,6 @@ describe("PiSubagentEventReader", () => {
     const asyncDir = mkdtempSync(join(tmpdir(), "paseo-pi-subagent-test-"));
     tempDirs.push(asyncDir);
     const emitted: AgentStreamEvent[] = [];
-    const signalRunner = vi.fn();
     writeFileSync(join(asyncDir, "events.jsonl"), "");
     writeFileSync(
       join(asyncDir, "status.json"),
@@ -265,7 +271,6 @@ describe("PiSubagentEventReader", () => {
       provider: "pi",
       emit: (event) => emitted.push(event),
       logger: { debug: vi.fn() } as unknown as Logger,
-      signalRunner,
     });
 
     await reader.readAvailable();
@@ -275,22 +280,73 @@ describe("PiSubagentEventReader", () => {
       type: "stop",
       source: "paseo",
     });
-    expect(emitted.slice(-2)).toEqual([
-      {
-        type: "provider_subagent",
-        provider: "pi",
-        event: { type: "upsert", id: "run-stop", canStop: false },
-      },
-      {
-        type: "provider_subagent",
-        provider: "pi",
-        event: { type: "upsert", id: "run-stop", status: "canceled", canStop: false },
-      },
-    ]);
-    expect(signalRunner).toHaveBeenCalledWith(
-      42,
-      process.platform === "win32" ? "SIGBREAK" : "SIGUSR2",
+    expect(emitted.at(-1)).toEqual({
+      type: "provider_subagent",
+      provider: "pi",
+      event: { type: "upsert", id: "run-stop", canStop: false },
+    });
+
+    writeFileSync(
+      join(asyncDir, "status.json"),
+      JSON.stringify({
+        runId: "run-stop",
+        mode: "single",
+        state: "stopped",
+        agent: "delegate",
+        model: "gemini-3.7-flash",
+        pid: 42,
+      }),
     );
+    await reader.readAvailable();
+
+    expect(emitted.at(-1)).toEqual({
+      type: "provider_subagent",
+      provider: "pi",
+      event: expect.objectContaining({
+        type: "upsert",
+        id: "run-stop",
+        status: "canceled",
+        canStop: false,
+      }),
+    });
+    reader.close();
+  });
+
+  test("uses the Pi control bridge when stopping a managed workflow", async () => {
+    const asyncDir = mkdtempSync(join(tmpdir(), "paseo-pi-subagent-test-"));
+    tempDirs.push(asyncDir);
+    const emitted: AgentStreamEvent[] = [];
+    const requestStop = vi.fn(async () => undefined);
+    writeFileSync(join(asyncDir, "events.jsonl"), "");
+    writeFileSync(
+      join(asyncDir, "status.json"),
+      JSON.stringify({
+        runId: "workflow-stop",
+        mode: "workflow",
+        state: "running",
+        pid: 42,
+        steps: [{ key: "main", agent: "delegate", status: "running" }],
+      }),
+    );
+    const reader = new PiSubagentEventReader({
+      id: "workflow-stop",
+      asyncDir,
+      provider: "pi",
+      emit: (event) => emitted.push(event),
+      logger: { debug: vi.fn() } as unknown as Logger,
+      requestStop,
+    });
+
+    await reader.readAvailable();
+    await reader.stop("workflow-stop:0:delegate");
+
+    expect(requestStop).toHaveBeenCalledWith("workflow-stop", asyncDir);
+    expect(existsSync(join(asyncDir, "control", "stop.json"))).toBe(false);
+    expect(emitted.at(-1)).toEqual({
+      type: "provider_subagent",
+      provider: "pi",
+      event: { type: "upsert", id: "workflow-stop:0:delegate", canStop: false },
+    });
     reader.close();
   });
 
