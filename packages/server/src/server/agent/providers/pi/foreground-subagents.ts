@@ -16,6 +16,8 @@ import {
 } from "./subagent-timeline.js";
 import {
   extractTextFromToolResult,
+  parseToolArgs,
+  parseToolResult,
   type PiToolResult,
   type PiTrackedToolCall,
 } from "./tool-call-mapper.js";
@@ -42,6 +44,7 @@ interface PiForegroundSubagentState {
   timelineCounts: Map<string, { result: number; session: number }>;
   lastProgress: string;
   finalMessagesMapped: boolean;
+  pendingFinalMessages?: PiAgentMessage[];
 }
 
 interface PiForegroundSubagentIndexOptions {
@@ -84,6 +87,12 @@ export interface PiAsyncSubagentRun {
   subtitle?: string;
   toolCallId: string;
   cwd?: string;
+}
+
+interface PiForegroundSubagentReplayOptions {
+  provider: AgentProvider;
+  messages: PiAgentMessage[];
+  contextWindowForModel?: (model: string) => number | undefined;
 }
 
 export class PiForegroundSubagentIndex {
@@ -176,6 +185,45 @@ export class PiForegroundSubagentIndex {
     }
   }
 
+  replayHistory(messages: PiAgentMessage[]): AgentStreamEvent[] {
+    const toolCalls = new Map<string, PiTrackedToolCall>();
+    const events: AgentStreamEvent[] = [];
+    for (const message of messages) {
+      if (message.role === "assistant") {
+        for (const content of message.content) {
+          if (content.type !== "toolCall") continue;
+          toolCalls.set(content.id, parseToolArgs(content.name, content.arguments));
+        }
+        continue;
+      }
+      if (message.role !== "toolResult") continue;
+      const toolCall = toolCalls.get(message.toolCallId) ?? parseToolArgs(message.toolName, null);
+      if (!isSubagentExecution(toolCall) || isAsyncExecution(toolCall)) continue;
+      const result = replayToolResult(message);
+      const details = resultDetails(result);
+      if (typeof details?.asyncDir === "string" || typeof details?.asyncId === "string") continue;
+      const results = recordArray(details?.results);
+      const sessionEvents = childIndices(results, []).flatMap((index) => {
+        const sessionFile = readString(findChild(results, index)?.sessionFile);
+        return sessionFile
+          ? this.readHistoricalSession(this.stateFor(message.toolCallId, index), sessionFile)
+          : [];
+      });
+      const completedEvents = this.handle(
+        message.toolCallId,
+        toolCall,
+        message.isError ? "failed" : "completed",
+        result,
+      );
+      events.push(
+        ...completedEvents.filter(isProviderSubagentUpsert),
+        ...sessionEvents,
+        ...completedEvents.filter((event) => !isProviderSubagentUpsert(event)),
+      );
+    }
+    return events;
+  }
+
   requestStop(id: string): AgentStreamEvent[] | null {
     for (const children of this.states.values()) {
       if (![...children.values()].some((state) => state.id === id)) continue;
@@ -220,7 +268,7 @@ export class PiForegroundSubagentIndex {
           await Promise.all([...children.values()].map((state) => this.readSession(state)));
         }
         if (watcher.terminalAt !== null && watcher.terminalAt <= now) {
-          for (const state of children?.values() ?? []) state.session?.close();
+          this.finalizeSessionStates(children);
           this.states.delete(toolCallId);
           this.sessionWatchers.delete(toolCallId);
         }
@@ -406,6 +454,41 @@ export class PiForegroundSubagentIndex {
     if (subtitleChanged) this.emitSubtitle(state);
   }
 
+  private readHistoricalSession(
+    state: PiForegroundSubagentState,
+    sessionFile: string,
+  ): AgentStreamEvent[] {
+    let text: string;
+    try {
+      text = readFileSync(sessionFile, "utf8");
+    } catch {
+      return [];
+    }
+    const identity = readSessionIdentity(sessionFile);
+    state.title ??= identity.agent;
+    state.description ??= cleanDescription(identity.task);
+    const events: AgentStreamEvent[] = [];
+    for (const line of text.split("\n")) {
+      const record = parseJsonRecord(line);
+      if (!record) continue;
+      if (record.type === "model_change") {
+        const provider = readString(record.provider);
+        const model = readString(record.modelId);
+        if (model) state.model = provider ? `${provider}/${model}` : model;
+        continue;
+      }
+      if (record.type === "thinking_level_change") {
+        state.thinking = readString(record.thinkingLevel) ?? state.thinking;
+        continue;
+      }
+      if (record.type !== "message") continue;
+      const message = parsePiAgentMessage(record.message);
+      if (!message) continue;
+      events.push(...this.mapMessages(state, [message], "session", eventTimestamp(record)));
+    }
+    return events;
+  }
+
   private updateModel(
     state: PiForegroundSubagentState,
     result: Record<string, unknown> | undefined,
@@ -479,7 +562,8 @@ export class PiForegroundSubagentIndex {
     const childProgress = findChild(snapshot.progress, index);
     const state = this.stateFor(snapshot.toolCallId, index);
     const childStatus = resolveChildStatus(snapshot.status, childResult, childProgress);
-    const description = resolveDescription(snapshot.args, childResult, childProgress);
+    const description =
+      resolveDescription(snapshot.args, childResult, childProgress) ?? state.description;
     const title = resolveTitle(snapshot.args, childResult, childProgress);
     state.title = title;
     state.description = description;
@@ -537,18 +621,55 @@ export class PiForegroundSubagentIndex {
     state.finalMessagesMapped = true;
     const messages = parseMessages(result?.messages);
     if (messages.length > 0) {
-      return this.mapMessages(state, messages, "result");
+      return this.mapOrDeferFinalMessages(state, snapshot.toolCallId, messages);
     }
     if (state.index !== 0) return [];
     const text =
       readString(result?.finalOutput) ?? extractTextFromToolResult(snapshot.result)?.trim();
     return text
-      ? this.mapMessages(
-          state,
-          [{ role: "assistant", content: [{ type: "text", text }] }],
-          "result",
-        )
+      ? this.mapOrDeferFinalMessages(state, snapshot.toolCallId, [
+          { role: "assistant", content: [{ type: "text", text }] },
+        ])
       : [];
+  }
+
+  private mapOrDeferFinalMessages(
+    state: PiForegroundSubagentState,
+    toolCallId: string,
+    messages: PiAgentMessage[],
+  ): AgentStreamEvent[] {
+    if (!this.sessionWatchers.has(toolCallId)) return this.mapMessages(state, messages, "result");
+    state.pendingFinalMessages = messages;
+    return [];
+  }
+
+  private flushPendingFinal(state: PiForegroundSubagentState): AgentStreamEvent[] {
+    const messages = state.pendingFinalMessages;
+    state.pendingFinalMessages = undefined;
+    return messages ? this.mapMessages(state, messages, "result") : [];
+  }
+
+  private finalizeSessionStates(
+    children: Map<number, PiForegroundSubagentState> | undefined,
+  ): void {
+    for (const state of children?.values() ?? []) {
+      for (const event of this.flushPendingFinal(state)) this.options.emit?.(event);
+      state.session?.close();
+    }
+  }
+}
+
+export function replayPiForegroundSubagents(
+  options: PiForegroundSubagentReplayOptions,
+): AgentStreamEvent[] {
+  const index = new PiForegroundSubagentIndex({
+    provider: options.provider,
+    contextWindowForModel: options.contextWindowForModel,
+  });
+  try {
+    return index.replayHistory(options.messages);
+  } finally {
+    index.close();
   }
 }
 
@@ -584,6 +705,10 @@ function providerEvent(
   return { type: "provider_subagent", provider, event };
 }
 
+function isProviderSubagentUpsert(event: AgentStreamEvent): boolean {
+  return event.type === "provider_subagent" && event.event.type === "upsert";
+}
+
 function isSubagentExecution(toolCall: PiTrackedToolCall): boolean {
   if (toolCall.toolName === "task") return true;
   if (toolCall.toolName !== "subagent" || !isRecord(toolCall.args)) return false;
@@ -602,6 +727,15 @@ function isAsyncExecution(toolCall: PiTrackedToolCall): boolean {
 function resultDetails(result: PiToolResult): Record<string, unknown> | null {
   if (!result || typeof result === "string" || !isRecord(result.details)) return null;
   return result.details;
+}
+
+function replayToolResult(message: Extract<PiAgentMessage, { role: "toolResult" }>): PiToolResult {
+  let content: unknown[] | undefined;
+  if (Array.isArray(message.content)) content = message.content;
+  if (typeof message.content === "string") {
+    content = [{ type: "text", text: message.content }];
+  }
+  return parseToolResult({ ...(content ? { content } : {}), details: message.details });
 }
 
 function resolveChildStatus(
@@ -661,8 +795,10 @@ function resolveDescription(
   result: Record<string, unknown> | undefined,
   progress: Record<string, unknown> | undefined,
 ): string | undefined {
-  return cleanDescription(
-    readString(result?.task) ?? readString(progress?.task) ?? readString(args.task),
+  return (
+    cleanDescription(readString(result?.task)) ??
+    cleanDescription(readString(progress?.task)) ??
+    cleanDescription(readString(args.task))
   );
 }
 

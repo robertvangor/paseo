@@ -14,7 +14,7 @@ import path from "node:path";
 import pino from "pino";
 import { setImmediate as waitForImmediate } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
-import { describe, expect, onTestFinished, test } from "vitest";
+import { describe, expect, onTestFinished, test, vi } from "vitest";
 
 import type { AgentSession, AgentSessionConfig, AgentStreamEvent } from "../../agent-sdk-types.js";
 import { PiRpcAgentClient, PiRpcAgentSession, transformPiModels } from "./agent.js";
@@ -179,6 +179,97 @@ test("keeps normal Pi agent sessions persisted", async () => {
 
   expect(pi.recordedLaunches[0]?.argv).not.toContain("--no-session");
 
+  await session.close();
+});
+
+test("restores foreground subagents from Pi history", async () => {
+  const sessionDir = mkdtempSync(path.join(tmpdir(), "paseo-pi-history-subagent-test-"));
+  onTestFinished(() => rmSync(sessionDir, { recursive: true, force: true }));
+  const sessionFile = path.join(sessionDir, "session.jsonl");
+  writeFileSync(
+    sessionFile,
+    [
+      { type: "session", id: "child-session" },
+      { type: "model_change", provider: "google", modelId: "gemini-3.1-pro-preview" },
+      { type: "thinking_level_change", thinkingLevel: "medium" },
+      {
+        type: "message",
+        message: { role: "user", content: [{ type: "text", text: "Task: Confirm briefly" }] },
+      },
+      {
+        type: "message",
+        message: {
+          role: "assistant",
+          responseId: "child-response",
+          content: [{ type: "text", text: "Confirmed." }],
+          usage: { totalTokens: 1_234, cost: { total: 0.0042 } },
+        },
+      },
+    ]
+      .map((entry) => JSON.stringify(entry))
+      .join("\n") + "\n",
+  );
+  const { pi, session } = await createSession();
+  const fakeSession = pi.latestSession();
+  fakeSession.models = [
+    { provider: "google", id: "gemini-3.1-pro-preview", contextWindow: 1_000_000 },
+  ];
+  fakeSession.messages = [
+    {
+      role: "assistant",
+      content: [
+        {
+          type: "toolCall",
+          id: "parent-tool",
+          name: "subagent",
+          arguments: { agent: "delegate", task: "Confirm briefly" },
+        },
+      ],
+    },
+    {
+      role: "toolResult",
+      toolCallId: "parent-tool",
+      toolName: "subagent",
+      content: [{ type: "text", text: "Confirmed." }],
+      details: {
+        results: [
+          {
+            index: 0,
+            agent: "delegate",
+            model: "google/gemini-3.1-pro-preview:medium",
+            thinking: "medium",
+            sessionFile,
+            finalOutput: "Confirmed.",
+          },
+        ],
+      },
+    },
+  ];
+
+  const history: AgentStreamEvent[] = [];
+  for await (const event of session.streamHistory()) history.push(event);
+
+  expect(history).toContainEqual({
+    type: "provider_subagent",
+    provider: "pi",
+    event: expect.objectContaining({
+      type: "upsert",
+      id: "parent-tool:0",
+      status: "completed",
+      canStop: false,
+      subtitle:
+        "google/gemini-3.1-pro-preview:medium · medium · 1.2k / 1m context · 1.2k tokens · $0.0042",
+    }),
+  });
+  expect(history).toContainEqual({
+    type: "provider_subagent",
+    provider: "pi",
+    event: {
+      type: "timeline",
+      id: "parent-tool:0",
+      item: { type: "assistant_message", text: "Confirmed.", messageId: "child-response" },
+    },
+  });
   await session.close();
 });
 
@@ -847,18 +938,21 @@ describe("PiRpcAgentSession", () => {
       },
       isError: false,
     });
-    await waitForImmediate();
-
-    expect(events.providerSubagentEvents()).toContainEqual({
-      type: "provider_subagent",
-      provider: "pi",
-      event: {
-        type: "upsert",
-        id: "foreground-tool:0",
-        subtitle:
-          "openai-codex/gpt-5.6-sol:medium · medium · 1.2k / 200k context · 1.2k tokens · $0.0042",
+    await vi.waitFor(
+      () => {
+        expect(events.providerSubagentEvents()).toContainEqual({
+          type: "provider_subagent",
+          provider: "pi",
+          event: {
+            type: "upsert",
+            id: "foreground-tool:0",
+            subtitle:
+              "openai-codex/gpt-5.6-sol:medium · medium · 1.2k / 200k context · 1.2k tokens · $0.0042",
+          },
+        });
       },
-    });
+      { timeout: 2_000 },
+    );
     await session.close();
   });
 

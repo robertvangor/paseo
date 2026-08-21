@@ -4,8 +4,13 @@ import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
 import type { AgentStreamEvent } from "../../agent-sdk-types.js";
+import type { PiAgentMessage } from "./rpc-types.js";
 
-import { PiForegroundSubagentIndex, readPiAsyncSubagentRun } from "./foreground-subagents.js";
+import {
+  PiForegroundSubagentIndex,
+  readPiAsyncSubagentRun,
+  replayPiForegroundSubagents,
+} from "./foreground-subagents.js";
 import { parseToolArgs, parseToolResult } from "./tool-call-mapper.js";
 
 const tempDirs: string[] = [];
@@ -279,6 +284,228 @@ describe("PiForegroundSubagentIndex", () => {
       expect.objectContaining({ event: expect.objectContaining({ type: "timeline" }) }),
     );
     index.close();
+  });
+
+  test("orders a short child transcript before its fallback result", async () => {
+    const sessionDir = mkdtempSync(join(tmpdir(), "paseo-pi-foreground-order-test-"));
+    tempDirs.push(sessionDir);
+    const parentSessionFile = join(sessionDir, "parent.jsonl");
+    writeFileSync(parentSessionFile, "");
+    const emitted: AgentStreamEvent[] = [];
+    const index = new PiForegroundSubagentIndex({
+      provider: "pi",
+      emit: (event) => emitted.push(event),
+      parentSessionFile: () => parentSessionFile,
+      pollIntervalMs: 60_000,
+    });
+    const toolCall = parseToolArgs("subagent", {
+      agent: "delegate",
+      task: "Confirm briefly",
+    });
+
+    index.handle("parent-tool", toolCall, "running", null);
+    const childDir = join(sessionDir, "parent", "run-1", "run-0");
+    mkdirSync(childDir, { recursive: true });
+    writeFileSync(
+      join(childDir, "session.jsonl"),
+      [
+        { type: "session", id: "child-session" },
+        { type: "session_info", name: "subagent-delegate-run-1-1" },
+        {
+          type: "message",
+          message: { role: "user", content: [{ type: "text", text: "Task: Confirm briefly" }] },
+        },
+        {
+          type: "message",
+          message: {
+            role: "assistant",
+            responseId: "child-response",
+            content: [
+              { type: "thinking", thinking: "Confirm the status" },
+              { type: "text", text: "Confirmed." },
+            ],
+          },
+        },
+      ]
+        .map((entry) => JSON.stringify(entry))
+        .join("\n") + "\n",
+    );
+
+    const completed = index.handle(
+      "parent-tool",
+      toolCall,
+      "completed",
+      parseToolResult({
+        details: {
+          results: [{ index: 0, agent: "delegate", finalOutput: "Confirmed." }],
+        },
+      }),
+    );
+    expect(completed).not.toContainEqual(
+      expect.objectContaining({ event: expect.objectContaining({ type: "timeline" }) }),
+    );
+
+    await index.flushSessions();
+
+    expect(
+      emitted.flatMap((event) =>
+        event.type === "provider_subagent" && event.event.type === "timeline"
+          ? [event.event.item]
+          : [],
+      ),
+    ).toEqual([
+      { type: "user_message", text: "Task: Confirm briefly" },
+      { type: "reasoning", text: "Confirm the status" },
+      { type: "assistant_message", text: "Confirmed.", messageId: "child-response" },
+    ]);
+    index.close();
+  });
+
+  test("uses the fallback result when no child session appears", async () => {
+    const sessionDir = mkdtempSync(join(tmpdir(), "paseo-pi-foreground-fallback-test-"));
+    tempDirs.push(sessionDir);
+    const parentSessionFile = join(sessionDir, "parent.jsonl");
+    writeFileSync(parentSessionFile, "");
+    const emitted: AgentStreamEvent[] = [];
+    const index = new PiForegroundSubagentIndex({
+      provider: "pi",
+      emit: (event) => emitted.push(event),
+      parentSessionFile: () => parentSessionFile,
+      pollIntervalMs: 60_000,
+      terminalDrainMs: 0,
+    });
+    const toolCall = parseToolArgs("subagent", {
+      agent: "delegate",
+      task: "Confirm briefly",
+    });
+
+    index.handle("parent-tool", toolCall, "running", null);
+    index.handle(
+      "parent-tool",
+      toolCall,
+      "completed",
+      parseToolResult({
+        details: {
+          results: [{ index: 0, agent: "delegate", finalOutput: "Confirmed." }],
+        },
+      }),
+    );
+    index.clearToolCall("parent-tool");
+
+    await vi.waitFor(() => {
+      expect(emitted).toContainEqual({
+        type: "provider_subagent",
+        provider: "pi",
+        event: {
+          type: "timeline",
+          id: "parent-tool:0",
+          item: expect.objectContaining({ type: "assistant_message", text: "Confirmed." }),
+        },
+      });
+    });
+    index.close();
+  });
+
+  test("replays completed foreground children from Pi history", () => {
+    const sessionDir = mkdtempSync(join(tmpdir(), "paseo-pi-foreground-replay-test-"));
+    tempDirs.push(sessionDir);
+    const sessionFile = join(sessionDir, "session.jsonl");
+    writeFileSync(
+      sessionFile,
+      [
+        { type: "session", id: "child-session" },
+        { type: "model_change", provider: "google", modelId: "gemini-3.1-pro-preview" },
+        { type: "thinking_level_change", thinkingLevel: "medium" },
+        {
+          type: "message",
+          message: { role: "user", content: [{ type: "text", text: "Task: Confirm briefly" }] },
+        },
+        {
+          type: "message",
+          message: {
+            role: "assistant",
+            responseId: "child-response",
+            content: [
+              { type: "thinking", thinking: "Confirm the status" },
+              { type: "text", text: "Confirmed." },
+            ],
+            usage: {
+              input: 1_000,
+              output: 234,
+              totalTokens: 1_234,
+              cost: { total: 0.0042 },
+            },
+          },
+        },
+      ]
+        .map((entry) => JSON.stringify(entry))
+        .join("\n") + "\n",
+    );
+    const messages: PiAgentMessage[] = [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            id: "parent-tool",
+            name: "subagent",
+            arguments: { agent: "delegate", task: "Confirm briefly" },
+          },
+        ],
+      },
+      {
+        role: "toolResult",
+        toolCallId: "parent-tool",
+        toolName: "subagent",
+        content: [{ type: "text", text: "Confirmed." }],
+        details: {
+          results: [
+            {
+              index: 0,
+              agent: "delegate",
+              task: "[prompt redacted]",
+              model: "google/gemini-3.1-pro-preview:medium",
+              thinking: "medium",
+              sessionFile,
+              finalOutput: "Confirmed.",
+            },
+          ],
+        },
+      },
+    ];
+
+    const events = replayPiForegroundSubagents({
+      provider: "pi",
+      messages,
+      contextWindowForModel: () => 1_000_000,
+    });
+
+    expect(events).toContainEqual({
+      type: "provider_subagent",
+      provider: "pi",
+      event: {
+        type: "upsert",
+        id: "parent-tool:0",
+        title: "delegate",
+        description: "Confirm briefly",
+        status: "completed",
+        canStop: false,
+        toolCallId: "parent-tool",
+        subtitle:
+          "google/gemini-3.1-pro-preview:medium · medium · 1.2k / 1m context · 1.2k tokens · $0.0042",
+      },
+    });
+    expect(
+      events.flatMap((event) =>
+        event.type === "provider_subagent" && event.event.type === "timeline"
+          ? [event.event.item]
+          : [],
+      ),
+    ).toEqual([
+      { type: "user_message", text: "Task: Confirm briefly" },
+      { type: "reasoning", text: "Confirm the status" },
+      { type: "assistant_message", text: "Confirmed.", messageId: "child-response" },
+    ]);
   });
 
   test("disables a foreground child when its workflow is stopped", () => {

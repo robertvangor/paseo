@@ -77,7 +77,11 @@ import type {
   PiThinkingLevel,
 } from "./rpc-types.js";
 import { PiUsagePoller, type PiUsagePollScheduler } from "./usage-poller.js";
-import { PiForegroundSubagentIndex, readPiAsyncSubagentRun } from "./foreground-subagents.js";
+import {
+  PiForegroundSubagentIndex,
+  readPiAsyncSubagentRun,
+  replayPiForegroundSubagents,
+} from "./foreground-subagents.js";
 import { PiSubagentTimelineBridge } from "./subagent-timeline.js";
 import {
   mapToolDetail,
@@ -1444,11 +1448,15 @@ export class PiRpcAgentSession implements AgentSession {
 
   async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
     await this.requestEntryCapture("history");
-    yield* streamPiHistory(
-      this.provider,
-      await this.runtimeSession.getMessages(),
-      this.capturedUserEntries,
-    );
+    const messages = await this.runtimeSession.getMessages();
+    yield* streamPiHistory(this.provider, messages, this.capturedUserEntries);
+    this.ensureSubagentModels();
+    await this.subagentModelsPromise;
+    yield* replayPiForegroundSubagents({
+      provider: this.provider,
+      messages,
+      contextWindowForModel: (model) => this.subagentContextWindow(model),
+    });
   }
 
   async getRuntimeInfo(): Promise<AgentRuntimeInfo> {
