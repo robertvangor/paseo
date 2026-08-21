@@ -992,6 +992,7 @@ class TestAgentSession implements AgentSession {
   private subscribers = new Set<(event: AgentStreamEvent) => void>();
   private turnIdCounter = 0;
   private interrupted = false;
+  readonly stoppedProviderSubagents: string[] = [];
 
   constructor(private readonly config: AgentSessionConfig) {}
 
@@ -1068,6 +1069,10 @@ class TestAgentSession implements AgentSession {
 
   async interrupt(): Promise<void> {
     this.interrupted = true;
+  }
+
+  async stopProviderSubagent(subagentId: string): Promise<void> {
+    this.stoppedProviderSubagents.push(subagentId);
   }
 
   async close(): Promise<void> {}
@@ -9770,6 +9775,40 @@ test("explicit close cancels running provider subagents before resume", async ()
     expect(manager.getProviderSubagent(parent.id, "provider-child-finishing")?.status).toBe(
       "completed",
     );
+  } finally {
+    await Promise.all(manager.listAgents().map((agent) => manager.closeAgent(agent.id))).catch(
+      () => undefined,
+    );
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("stops a controllable provider subagent through its parent session", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-stop-provider-child-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const client = new SessionRecordingAgentClient();
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+
+  try {
+    const parent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    client.sessions[0]!.pushEvent({
+      type: "provider_subagent",
+      provider: "codex",
+      event: {
+        type: "upsert",
+        id: "provider-child-running",
+        status: "running",
+        canStop: true,
+      },
+    });
+    await manager.flush();
+
+    await manager.stopProviderSubagent(parent.id, "provider-child-running");
+
+    expect(client.sessions[0]!.stoppedProviderSubagents).toEqual(["provider-child-running"]);
   } finally {
     await Promise.all(manager.listAgents().map((agent) => manager.closeAgent(agent.id))).catch(
       () => undefined,

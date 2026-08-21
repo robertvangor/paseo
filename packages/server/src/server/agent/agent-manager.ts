@@ -1144,6 +1144,18 @@ export class AgentManager {
     return this.providerSubagents.fetchTimeline(parentAgentId, subagentId, options);
   }
 
+  async stopProviderSubagent(parentAgentId: string, subagentId: string): Promise<void> {
+    const agent = this.requirePublicAgent(parentAgentId);
+    const subagent = this.providerSubagents.get(parentAgentId, subagentId);
+    if (!subagent) throw new Error("Provider subagent not found");
+    if (subagent.status !== "running") throw new Error("Provider subagent is no longer running");
+    if (!subagent.canStop) throw new Error("Provider subagent cannot be stopped");
+    if (!agent.session?.stopProviderSubagent) {
+      throw new Error(`Provider '${agent.provider}' does not support stopping subagent runs`);
+    }
+    await agent.session.stopProviderSubagent(subagentId);
+  }
+
   createAgent(
     config: AgentSessionConfig,
     agentId: string | undefined,

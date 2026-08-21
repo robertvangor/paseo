@@ -102,6 +102,8 @@ export const en = {
     cancel: {
       cancelingAgent: "Canceling agent",
       stopAgent: "Stop agent",
+      stopRun: "Stop run",
+      stoppingRun: "Stopping run",
       interrupt: "Interrupt",
     },
     voice: {

@@ -105,6 +105,8 @@ export const ptBR: TranslationResources = {
     cancel: {
       cancelingAgent: "Cancelando agente",
       stopAgent: "Parar agente",
+      stopRun: "Parar execução",
+      stoppingRun: "Parando execução",
       interrupt: "Interromper",
     },
     voice: {

@@ -105,6 +105,8 @@ export const es: TranslationResources = {
     cancel: {
       cancelingAgent: "Agente de cancelación",
       stopAgent: "detener agente",
+      stopRun: "Detener ejecución",
+      stoppingRun: "Deteniendo ejecución",
       interrupt: "Interrumpir",
     },
     voice: {

@@ -105,6 +105,8 @@ export const ja: TranslationResources = {
     cancel: {
       cancelingAgent: "エージェントをキャンセル中",
       stopAgent: "エージェントを停止",
+      stopRun: "実行を停止",
+      stoppingRun: "停止中",
       interrupt: "中断",
     },
     voice: {

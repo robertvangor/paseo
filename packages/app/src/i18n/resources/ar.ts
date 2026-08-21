@@ -105,6 +105,8 @@ export const ar: TranslationResources = {
     cancel: {
       cancelingAgent: "وكيل الإلغاء",
       stopAgent: "توقف الوكيل",
+      stopRun: "إيقاف التشغيل",
+      stoppingRun: "جارٍ إيقاف التشغيل",
       interrupt: "مقاطعة",
     },
     voice: {

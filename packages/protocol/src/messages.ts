@@ -1744,6 +1744,13 @@ export const ProviderSubagentTimelineRequestMessageSchema = z.object({
   limit: z.number().int().nonnegative().optional(),
 });
 
+export const ProviderSubagentStopRequestMessageSchema = z.object({
+  type: z.literal("agent.provider_subagents.stop.request"),
+  parentAgentId: z.string(),
+  subagentId: z.string(),
+  requestId: z.string(),
+});
+
 export const SetAgentTimelineSubscriptionRequestMessageSchema = z.object({
   type: z.literal("agent.timeline.set_subscription.request"),
   agentIds: z.array(z.string()),
@@ -3020,6 +3027,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   AgentTimelineListPromptsRequestMessageSchema,
   ProviderSubagentListRequestMessageSchema,
   ProviderSubagentTimelineRequestMessageSchema,
+  ProviderSubagentStopRequestMessageSchema,
   SetAgentTimelineSubscriptionRequestMessageSchema,
   AgentForkContextRequestMessageSchema,
   SetAgentModeRequestMessageSchema,
@@ -4293,6 +4301,7 @@ export const ProviderSubagentDescriptorPayloadSchema = z.object({
   // Compact provider-owned context for the shared track. Providers choose what belongs here and
   // format it for display; clients must not parse provider-specific facts out of this string.
   subtitle: z.string().nullable().optional(),
+  canStop: z.boolean().optional(),
 });
 
 export type ProviderSubagentDescriptorPayload = z.infer<
@@ -4335,6 +4344,16 @@ export const ProviderSubagentTimelineResponseMessageSchema = z.object({
         seq: z.number().int().nonnegative(),
       }),
     ),
+    error: z.string().nullable(),
+  }),
+});
+
+export const ProviderSubagentStopResponseMessageSchema = z.object({
+  type: z.literal("agent.provider_subagents.stop.response"),
+  payload: z.object({
+    requestId: z.string(),
+    parentAgentId: z.string(),
+    subagentId: z.string(),
     error: z.string().nullable(),
   }),
 });
@@ -6221,6 +6240,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   AgentTimelineListPromptsResponseMessageSchema,
   ProviderSubagentListResponseMessageSchema,
   ProviderSubagentTimelineResponseMessageSchema,
+  ProviderSubagentStopResponseMessageSchema,
   ProviderSubagentUpdateMessageSchema,
   SetAgentTimelineSubscriptionResponseMessageSchema,
   AgentAttentionRequiredMessageSchema,

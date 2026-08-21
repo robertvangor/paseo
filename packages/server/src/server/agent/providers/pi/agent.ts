@@ -1235,6 +1235,9 @@ function mapPiModel(model: PiModel, provider: AgentProvider): AgentModelDefiniti
     id: `${model.provider}/${model.id}`,
     label: `${model.provider}/${model.name ?? model.id}`,
     description: `${model.provider}/${model.id}`,
+    ...(typeof model.contextWindow === "number"
+      ? { contextWindowMaxTokens: model.contextWindow }
+      : {}),
     metadata: {
       provider: model.provider,
       modelId: model.id,
@@ -1285,6 +1288,8 @@ export class PiRpcAgentSession implements AgentSession {
   private readonly usagePoller: PiUsagePoller;
   private readonly foregroundSubagents: PiForegroundSubagentIndex;
   private readonly subagentTimelineBridge: PiSubagentTimelineBridge;
+  private readonly subagentContextWindows = new Map<string, number>();
+  private subagentModelsPromise: Promise<void> | null = null;
   private closed = false;
   // Pi reports an aborted OpenAI Responses stream before the abort RPC resolves.
   // Keep the turn active until that RPC acknowledges the user-requested cancellation.
@@ -1306,11 +1311,15 @@ export class PiRpcAgentSession implements AgentSession {
       null;
     this.extensionTimeoutMs = options.extensionTimeoutMs ?? DEFAULT_PI_EXTENSION_RESULT_TIMEOUT_MS;
     this.logger = options.logger;
+    this.indexSubagentModel(options.initialState.model ?? undefined);
     this.foregroundSubagents = new PiForegroundSubagentIndex({ provider: this.provider });
     this.subagentTimelineBridge = new PiSubagentTimelineBridge({
       provider: this.provider,
       emit: (event) => this.emit(event),
       logger: this.logger,
+      contextWindowForModel: (model) =>
+        this.subagentContextWindows.get(model) ??
+        this.subagentContextWindows.get(model.toLowerCase()),
     });
     this.usagePoller = new PiUsagePoller({
       scheduler: options.usagePollScheduler,
@@ -1588,6 +1597,35 @@ export class PiRpcAgentSession implements AgentSession {
     const payload = Buffer.from(JSON.stringify({ targetId, requestId })).toString("base64url");
     await this.runtimeSession.prompt(`/${PASEO_PI_TREE_EXTENSION_COMMAND} ${payload}`);
     return await resultPromise;
+  }
+
+  async stopProviderSubagent(subagentId: string): Promise<void> {
+    await this.subagentTimelineBridge.stop(subagentId);
+  }
+
+  private observeSubagentRun(id: string, asyncDir: string): void {
+    this.subagentTimelineBridge.observe(id, asyncDir);
+    this.subagentModelsPromise ??= this.runtimeSession
+      .getAvailableModels()
+      .then((models) => {
+        for (const model of models) this.indexSubagentModel(model);
+        this.subagentTimelineBridge.refreshSubtitles();
+        return undefined;
+      })
+      .catch((error) => {
+        this.logger.debug({ err: error }, "Pi subagent model context lookup failed");
+      });
+  }
+
+  private indexSubagentModel(model: PiModel | undefined): void {
+    if (!model || typeof model.contextWindow !== "number" || model.contextWindow <= 0) return;
+    const keys = [model.id, model.name, `${model.provider}/${model.id}`].filter(
+      (value): value is string => Boolean(value),
+    );
+    for (const key of keys) {
+      this.subagentContextWindows.set(key, model.contextWindow);
+      this.subagentContextWindows.set(key.toLowerCase(), model.contextWindow);
+    }
   }
 
   async close(): Promise<void> {
@@ -2021,7 +2059,7 @@ export class PiRpcAgentSession implements AgentSession {
       },
     });
     if (status === "running" && asyncDir) {
-      this.subagentTimelineBridge.observe(id, asyncDir);
+      this.observeSubagentRun(id, asyncDir);
     }
     return true;
   }
@@ -2395,7 +2433,7 @@ export class PiRpcAgentSession implements AgentSession {
           ...(asyncRun.subtitle ? { subtitle: asyncRun.subtitle } : {}),
         },
       });
-      this.subagentTimelineBridge.observe(asyncRun.id, asyncRun.asyncDir);
+      this.observeSubagentRun(asyncRun.id, asyncRun.asyncDir);
     }
     const detail = this.mapToolDetail(toolCallId, toolCall, result);
     if (!detail) {

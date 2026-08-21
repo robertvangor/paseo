@@ -575,6 +575,10 @@ export type ProviderSubagentTimelinePayload = Extract<
   SessionOutboundMessage,
   { type: "agent.provider_subagents.timeline.get.response" }
 >["payload"];
+export type ProviderSubagentStopPayload = Extract<
+  SessionOutboundMessage,
+  { type: "agent.provider_subagents.stop.response" }
+>["payload"];
 export interface FetchProviderSubagentTimelineOptions {
   direction?: ProviderSubagentTimelinePayload["direction"];
   cursor?: FetchAgentTimelineCursor;
@@ -2962,6 +2966,33 @@ export class DaemonClient {
     if (payload.error) {
       throw new Error(payload.error);
     }
+    return payload;
+  }
+
+  async stopProviderSubagent(
+    parentAgentId: string,
+    subagentId: string,
+    options: { requestId?: string; timeout?: number } = {},
+  ): Promise<ProviderSubagentStopPayload> {
+    const requestId = this.createRequestId(options.requestId);
+    const message = SessionInboundMessageSchema.parse({
+      type: "agent.provider_subagents.stop.request",
+      parentAgentId,
+      subagentId,
+      requestId,
+    });
+    const payload = await this.sendRequest({
+      requestId,
+      message,
+      timeout: options.timeout,
+      options: { skipQueue: true },
+      select: (response) =>
+        response.type === "agent.provider_subagents.stop.response" &&
+        response.payload.requestId === requestId
+          ? response.payload
+          : null,
+    });
+    if (payload.error) throw new Error(payload.error);
     return payload;
   }
 

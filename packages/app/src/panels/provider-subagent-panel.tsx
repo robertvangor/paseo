@@ -5,6 +5,8 @@ import invariant from "tiny-invariant";
 import { useShallow } from "zustand/react/shallow";
 import { AgentStreamView } from "@/agent-stream/view";
 import { getProviderIcon } from "@/components/provider-icons";
+import { Button } from "@/components/ui/button";
+import { useToast } from "@/contexts/toast-context";
 import type { AgentScreenAgent } from "@/hooks/use-agent-screen-state-machine";
 import { usePaneContext } from "@/panels/pane-context";
 import type { PanelDescriptor, PanelRegistration } from "@/panels/panel-registry";
@@ -64,6 +66,64 @@ function useProviderSubagentDescriptor(
         })
       : null,
   };
+}
+
+function ProviderSubagentHeader({
+  serverId,
+  parentAgentId,
+  subagentId,
+  subtitle,
+  canStop,
+}: {
+  serverId: string;
+  parentAgentId: string;
+  subagentId: string;
+  subtitle: string | undefined;
+  canStop: boolean;
+}) {
+  const { t } = useTranslation();
+  const toast = useToast();
+  const client = useSessionStore((state) => state.sessions[serverId]?.client ?? null);
+  const [isStopping, setIsStopping] = useState(false);
+
+  useEffect(() => {
+    if (!canStop) setIsStopping(false);
+  }, [canStop]);
+
+  const stopRun = useCallback(() => {
+    if (!client || !canStop || isStopping) return;
+    setIsStopping(true);
+    void client.stopProviderSubagent(parentAgentId, subagentId).catch((error) => {
+      setIsStopping(false);
+      toast.error(error instanceof Error ? error.message : String(error));
+    });
+  }, [canStop, client, isStopping, parentAgentId, subagentId, toast]);
+
+  if (!subtitle && !canStop) return null;
+  return (
+    <View style={styles.subtitleHeader}>
+      {subtitle ? (
+        <Text
+          style={styles.subtitleText}
+          numberOfLines={1}
+          testID="provider-subagent-pane-subtitle"
+        >
+          {subtitle}
+        </Text>
+      ) : null}
+      {canStop ? (
+        <Button
+          variant="destructive"
+          size="xs"
+          loading={isStopping}
+          onPress={stopRun}
+          testID="provider-subagent-stop-run"
+        >
+          {isStopping ? t("composer.cancel.stoppingRun") : t("composer.cancel.stopRun")}
+        </Button>
+      ) : null}
+    </View>
+  );
 }
 
 function ProviderSubagentPanel() {
@@ -142,6 +202,7 @@ function ProviderSubagentPanel() {
   const progressKey =
     timeline?.epoch && firstTimelineSeq !== null ? `${timeline.epoch}:${firstTimelineSeq}` : null;
   const subtitle = descriptor?.subtitle?.trim();
+  const canStop = descriptor?.status === "running" && descriptor.canStop === true;
 
   const streamContext = useMemo<AgentScreenAgent>(
     () => ({
@@ -184,17 +245,13 @@ function ProviderSubagentPanel() {
 
   return (
     <View style={styles.container} testID="provider-subagent-panel">
-      {subtitle ? (
-        <View style={styles.subtitleHeader}>
-          <Text
-            style={styles.subtitleText}
-            numberOfLines={1}
-            testID="provider-subagent-pane-subtitle"
-          >
-            {subtitle}
-          </Text>
-        </View>
-      ) : null}
+      <ProviderSubagentHeader
+        serverId={serverId}
+        parentAgentId={target.parentAgentId}
+        subagentId={target.subagentId}
+        subtitle={subtitle}
+        canStop={canStop}
+      />
       <AgentStreamView
         agentId={streamId}
         serverId={serverId}
@@ -215,12 +272,16 @@ function ProviderSubagentPanel() {
 const styles = StyleSheet.create((theme) => ({
   container: { flex: 1, minHeight: 0 },
   subtitleHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: theme.spacing[2],
     paddingHorizontal: theme.spacing[3],
     paddingVertical: theme.spacing[1],
     borderBottomWidth: theme.borderWidth[1],
     borderBottomColor: theme.colors.border,
   },
   subtitleText: {
+    flex: 1,
     color: theme.colors.foregroundMuted,
     fontSize: theme.fontSize.sm,
   },

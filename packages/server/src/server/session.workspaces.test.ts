@@ -8406,6 +8406,7 @@ test("overlapping workspace rebuilds publish the newest provider subagent status
     toolCallId: null,
     cwd: REPO_CWD,
     subtitle: null,
+    canStop: false,
   };
   providerSubagents.push(runningSubagent);
   listener?.({ type: "provider_subagent", event: { type: "upsert", subagent: runningSubagent } });

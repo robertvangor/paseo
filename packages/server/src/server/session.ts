@@ -2184,6 +2184,8 @@ export class Session {
         return this.handleProviderSubagentListRequest(msg);
       case "agent.provider_subagents.timeline.get.request":
         return this.handleProviderSubagentTimelineRequest(msg);
+      case "agent.provider_subagents.stop.request":
+        return this.handleProviderSubagentStopRequest(msg);
       case "agent.timeline.set_subscription.request": {
         const agentIds = [...new Set(msg.agentIds)].sort();
         if (
@@ -7098,6 +7100,31 @@ export class Session {
         },
       });
     }
+  }
+
+  private async handleProviderSubagentStopRequest(
+    msg: Extract<SessionInboundMessage, { type: "agent.provider_subagents.stop.request" }>,
+  ): Promise<void> {
+    let error: string | null = null;
+    try {
+      await ensureUnarchivedAgentLoaded(msg.parentAgentId, {
+        agentManager: this.agentManager,
+        agentStorage: this.agentStorage,
+        logger: this.sessionLogger,
+      });
+      await this.agentManager.stopProviderSubagent(msg.parentAgentId, msg.subagentId);
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : String(cause);
+    }
+    this.emit({
+      type: "agent.provider_subagents.stop.response",
+      payload: {
+        requestId: msg.requestId,
+        parentAgentId: msg.parentAgentId,
+        subagentId: msg.subagentId,
+        error,
+      },
+    });
   }
 
   private async handleAgentForkContextRequest(

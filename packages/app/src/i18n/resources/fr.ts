@@ -107,6 +107,8 @@ export const fr: TranslationResources = {
     cancel: {
       cancelingAgent: "Agent d'annulation",
       stopAgent: "Agent d'arrêt",
+      stopRun: "Arrêter l’exécution",
+      stoppingRun: "Arrêt de l’exécution",
       interrupt: "Interrompre",
     },
     voice: {

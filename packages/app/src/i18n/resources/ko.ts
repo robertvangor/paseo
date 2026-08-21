@@ -105,6 +105,8 @@ export const ko: TranslationResources = {
     cancel: {
       cancelingAgent: "에이전트 취소 중",
       stopAgent: "에이전트 중지",
+      stopRun: "실행 중지",
+      stoppingRun: "중지 중",
       interrupt: "중단",
     },
     voice: {

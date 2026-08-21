@@ -654,6 +654,7 @@ export interface AgentSession {
   ): Promise<AgentPermissionResult | void>;
   describePersistence(): AgentPersistenceHandle | null;
   interrupt(): Promise<void>;
+  stopProviderSubagent?(subagentId: string): Promise<void>;
   /** Release live runtime resources without archiving or deleting the durable native session. */
   close(): Promise<void>;
   listCommands?(): Promise<AgentSlashCommand[]>;

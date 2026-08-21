@@ -105,6 +105,8 @@ export const ru: TranslationResources = {
     cancel: {
       cancelingAgent: "Отменяющий агент",
       stopAgent: "Остановить агент",
+      stopRun: "Остановить запуск",
+      stoppingRun: "Остановка запуска",
       interrupt: "Прерывать",
     },
     voice: {

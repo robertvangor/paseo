@@ -105,6 +105,8 @@ export const zhCN: TranslationResources = {
     cancel: {
       cancelingAgent: "正在取消 Agent",
       stopAgent: "停止 Agent",
+      stopRun: "停止运行",
+      stoppingRun: "正在停止运行",
       interrupt: "中断",
     },
     voice: {

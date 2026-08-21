@@ -22,6 +22,7 @@ export interface ProviderSubagentDescriptor {
   toolCallId: string | null;
   cwd: string | null;
   subtitle: string | null;
+  canStop: boolean;
 }
 
 export type ProviderSubagentInputEvent =
@@ -38,6 +39,7 @@ export type ProviderSubagentInputEvent =
       toolCallId?: string | null;
       cwd?: string | null;
       subtitle?: string | null;
+      canStop?: boolean;
       timestamp?: string;
     }
   | {
@@ -111,18 +113,20 @@ export class ProviderSubagentStore {
       this.timelines.initialize(key);
     }
     const timestamp = event.timestamp ?? new Date().toISOString();
+    const status = event.status ?? previous?.status ?? "running";
     const subagent: ProviderSubagentDescriptor = {
       id: event.id,
       parentAgentId,
       provider,
       title: stickyField(event.title, previous?.title),
       description: stickyField(event.description, previous?.description),
-      status: event.status ?? previous?.status ?? "running",
+      status,
       createdAt: previous?.createdAt ?? timestamp,
       updatedAt: timestamp,
       toolCallId: stickyField(event.toolCallId, previous?.toolCallId),
       cwd: stickyField(event.cwd, previous?.cwd),
       subtitle: stickyField(event.subtitle, previous?.subtitle),
+      canStop: status === "running" && (event.canStop ?? previous?.canStop ?? false),
     };
     this.descriptors.set(key, subagent);
     return { type: "upsert", subagent };

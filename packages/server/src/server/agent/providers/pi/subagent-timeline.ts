@@ -2,6 +2,7 @@ import { open, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Logger } from "pino";
 
+import { writeJsonFileAtomic } from "../../../atomic-file.js";
 import type { AgentProvider, AgentStreamEvent } from "../../agent-sdk-types.js";
 import { PiHistoryMapper } from "./history-mapper.js";
 import type { PiAgentMessage } from "./rpc-types.js";
@@ -9,6 +10,7 @@ import type { PiAgentMessage } from "./rpc-types.js";
 const READ_BUFFER_BYTES = 64 * 1024;
 const DEFAULT_POLL_INTERVAL_MS = 250;
 const DEFAULT_TERMINAL_DRAIN_MS = 1_000;
+const STOP_SIGNAL_FALLBACK_DELAY_MS = 250;
 
 type PiSubagentTimelineLogger = Pick<Logger, "debug">;
 type PiSubagentStatus = "running" | "completed" | "failed" | "canceled";
@@ -28,6 +30,7 @@ interface PiMessageCounts {
 interface PiSubagentUsage {
   totalTokens?: number;
   totalCostUsd?: number;
+  contextUsedTokens?: number;
 }
 
 export interface PiSubagentEventReaderOptions {
@@ -36,6 +39,8 @@ export interface PiSubagentEventReaderOptions {
   provider: AgentProvider;
   emit: (event: AgentStreamEvent) => void;
   logger: PiSubagentTimelineLogger;
+  contextWindowForModel?: (model: string) => number | undefined;
+  signalRunner?: (pid: number, signal: NodeJS.Signals) => void;
 }
 
 export class PiSubagentEventReader {
@@ -48,13 +53,17 @@ export class PiSubagentEventReader {
   private readonly lastProgress = new Map<string, string>();
   private readonly lastDescriptors = new Map<string, string>();
   private readonly baseSubtitles = new Map<string, string>();
+  private readonly models = new Map<string, string>();
   private readonly usage = new Map<string, PiSubagentUsage>();
+  private readonly statuses = new Map<string, PiSubagentStatus>();
   private lastStatusText = "";
   private usesStepDescriptors = false;
   private rootRemoved = false;
   private reading = false;
   private closed = false;
   private terminal = false;
+  private stopRequested = false;
+  private runnerPid: number | undefined;
 
   constructor(private readonly options: PiSubagentEventReaderOptions) {
     this.eventsPath = join(options.asyncDir, "events.jsonl");
@@ -88,7 +97,63 @@ export class PiSubagentEventReader {
     this.mappers.clear();
     this.messageCounts.clear();
     this.baseSubtitles.clear();
+    this.models.clear();
     this.usage.clear();
+    this.statuses.clear();
+  }
+
+  hasDescriptor(id: string): boolean {
+    return this.lastDescriptors.has(id);
+  }
+
+  async stop(id: string): Promise<void> {
+    await this.readAvailable();
+    if (!this.hasDescriptor(id)) throw new Error("Pi subagent run was not found");
+    if (this.statuses.get(id) !== "running" || this.terminal) {
+      throw new Error("Pi subagent run is no longer running");
+    }
+    if (this.stopRequested) return;
+    await writeJsonFileAtomic(join(this.options.asyncDir, "control", "stop.json"), {
+      type: "stop",
+      ts: Date.now(),
+      source: "paseo",
+    });
+    this.stopRequested = true;
+    for (const [descriptorId, status] of this.statuses) {
+      if (status === "running")
+        this.emitDescriptor({ type: "upsert", id: descriptorId, canStop: false });
+    }
+    await new Promise((resolve) => setTimeout(resolve, STOP_SIGNAL_FALLBACK_DELAY_MS));
+    await this.readAvailable();
+    if (!this.terminal && this.runnerPid && this.runnerPid !== process.pid) {
+      try {
+        (this.options.signalRunner ?? signalPiRunner)(this.runnerPid, piInterruptSignal());
+        this.terminal = true;
+        for (const [descriptorId, status] of this.statuses) {
+          if (status !== "running") continue;
+          this.statuses.set(descriptorId, "canceled");
+          this.emitDescriptor({
+            type: "upsert",
+            id: descriptorId,
+            status: "canceled",
+            canStop: false,
+          });
+        }
+        this.closed = true;
+      } catch (error) {
+        this.options.logger.debug(
+          { err: error, pid: this.runnerPid, subagentId: this.options.id },
+          "Pi subagent stop fallback signal failed",
+        );
+      }
+    }
+  }
+
+  refreshSubtitles(): void {
+    for (const id of this.lastDescriptors.keys()) {
+      const subtitle = this.buildSubtitle(id);
+      if (subtitle) this.emitDescriptor({ type: "upsert", id, subtitle });
+    }
   }
 
   private async readEvents(): Promise<void> {
@@ -139,6 +204,7 @@ export class PiSubagentEventReader {
   }
 
   private consumeStatus(status: Record<string, unknown>): void {
+    this.runnerPid = readProcessId(status.pid);
     const lifecycle = statusValue(status.state);
     this.terminal = lifecycle !== "running";
     const steps = recordArray(status.steps);
@@ -151,6 +217,7 @@ export class PiSubagentEventReader {
     if (!this.rootRemoved) {
       this.rootRemoved = true;
       this.lastDescriptors.delete(this.options.id);
+      this.statuses.delete(this.options.id);
       this.options.emit({
         type: "provider_subagent",
         provider: this.options.provider,
@@ -172,10 +239,12 @@ export class PiSubagentEventReader {
       const description = cleanDescription(readString(step.description));
       const subtitle = this.resolveSubtitle(id, step);
       const timestamp = statusTimestamp(step) ?? statusTimestamp(status);
+      const stepStatus = statusValue(step.status ?? status.state);
       this.emitDescriptor({
         type: "upsert",
         id,
-        status: statusValue(step.status ?? status.state),
+        status: stepStatus,
+        canStop: stepStatus === "running" && lifecycle === "running" && !this.stopRequested,
         title,
         ...(description ? { description } : {}),
         ...(subtitle ? { subtitle } : {}),
@@ -191,6 +260,10 @@ export class PiSubagentEventReader {
     for (const id of this.lastDescriptors.keys()) {
       if (activeIds.has(id)) continue;
       this.lastDescriptors.delete(id);
+      this.statuses.delete(id);
+      this.baseSubtitles.delete(id);
+      this.models.delete(id);
+      this.usage.delete(id);
       this.options.emit({
         type: "provider_subagent",
         provider: this.options.provider,
@@ -209,6 +282,7 @@ export class PiSubagentEventReader {
       type: "upsert",
       id: this.options.id,
       status: lifecycle,
+      canStop: lifecycle === "running" && !this.stopRequested,
       ...(title ? { title } : {}),
       ...(description ? { description } : {}),
       ...(subtitle ? { subtitle } : {}),
@@ -230,6 +304,7 @@ export class PiSubagentEventReader {
     descriptor: Extract<AgentStreamEvent, { type: "provider_subagent" }>["event"],
   ): void {
     if (descriptor.type !== "upsert") return;
+    if (descriptor.status) this.statuses.set(descriptor.id, descriptor.status);
     const signature = JSON.stringify(descriptor);
     if (this.lastDescriptors.get(descriptor.id) === signature) return;
     this.lastDescriptors.set(descriptor.id, signature);
@@ -285,7 +360,10 @@ export class PiSubagentEventReader {
     const base = joinSubtitle(value);
     if (base) this.baseSubtitles.set(id, base);
     else this.baseSubtitles.delete(id);
-    return buildUsageSubtitle(base, this.usage.get(id));
+    const model = readString(value.model);
+    if (model) this.models.set(id, model);
+    else this.models.delete(id);
+    return this.buildSubtitle(id);
   }
 
   private consumeUsage(id: string, message: unknown): void {
@@ -294,8 +372,14 @@ export class PiSubagentEventReader {
     const previous = this.usage.get(id);
     const next = mergeUsage(previous, increment);
     this.usage.set(id, next);
-    const subtitle = buildUsageSubtitle(this.baseSubtitles.get(id), next);
+    const subtitle = this.buildSubtitle(id);
     if (subtitle) this.emitDescriptor({ type: "upsert", id, subtitle });
+  }
+
+  private buildSubtitle(id: string): string | undefined {
+    const model = this.models.get(id);
+    const contextWindow = model ? this.options.contextWindowForModel?.(model) : undefined;
+    return buildUsageSubtitle(this.baseSubtitles.get(id), this.usage.get(id), contextWindow);
   }
 
   private emitMessage(
@@ -371,6 +455,7 @@ interface PiSubagentTimelineBridgeOptions {
   provider: AgentProvider;
   emit: (event: AgentStreamEvent) => void;
   logger: PiSubagentTimelineLogger;
+  contextWindowForModel?: (model: string) => number | undefined;
   pollIntervalMs?: number;
   terminalDrainMs?: number;
 }
@@ -402,6 +487,7 @@ export class PiSubagentTimelineBridge {
       provider: this.options.provider,
       emit: this.options.emit,
       logger: this.options.logger,
+      contextWindowForModel: this.options.contextWindowForModel,
     });
     this.runs.set(id, { reader, terminalAt: null });
     void reader.readAvailable();
@@ -415,6 +501,16 @@ export class PiSubagentTimelineBridge {
       void this.poll();
     }
     return this.observedIds.has(id);
+  }
+
+  async stop(id: string): Promise<void> {
+    const run = [...this.runs.values()].find((candidate) => candidate.reader.hasDescriptor(id));
+    if (!run) throw new Error("Pi subagent run was not found");
+    await run.reader.stop(id);
+  }
+
+  refreshSubtitles(): void {
+    for (const run of this.runs.values()) run.reader.refreshSubtitles();
   }
 
   close(): void {
@@ -543,12 +639,17 @@ function readAssistantUsage(message: unknown): PiSubagentUsage | null {
   const usage = message.usage;
   const input = readPositiveNumber(usage.input);
   const output = readPositiveNumber(usage.output);
-  const totalTokens = readPositiveNumber(usage.totalTokens) ?? sumNumbers(input, output);
+  const cacheRead = readPositiveNumber(usage.cacheRead);
+  const cacheWrite = readPositiveNumber(usage.cacheWrite);
+  const contextUsedTokens =
+    readPositiveNumber(usage.totalTokens) ?? sumNumbers(input, output, cacheRead, cacheWrite);
   const cost = usage.cost;
   const totalCostUsd = isRecord(cost) ? readPositiveNumber(cost.total) : readPositiveNumber(cost);
-  if (totalTokens === undefined && totalCostUsd === undefined) return null;
+  if (contextUsedTokens === undefined && totalCostUsd === undefined) return null;
   return {
-    ...(totalTokens !== undefined ? { totalTokens } : {}),
+    ...(contextUsedTokens !== undefined
+      ? { totalTokens: contextUsedTokens, contextUsedTokens }
+      : {}),
     ...(totalCostUsd !== undefined ? { totalCostUsd } : {}),
   };
 }
@@ -559,26 +660,49 @@ function mergeUsage(
 ): PiSubagentUsage {
   const totalTokens = sumNumbers(previous?.totalTokens, increment.totalTokens);
   const totalCostUsd = sumNumbers(previous?.totalCostUsd, increment.totalCostUsd);
+  const contextUsedTokens = increment.contextUsedTokens ?? previous?.contextUsedTokens;
   return {
     ...(totalTokens !== undefined ? { totalTokens } : {}),
     ...(totalCostUsd !== undefined ? { totalCostUsd } : {}),
+    ...(contextUsedTokens !== undefined ? { contextUsedTokens } : {}),
   };
 }
 
 function buildUsageSubtitle(
   base: string | undefined,
   usage: PiSubagentUsage | undefined,
+  contextWindow: number | undefined,
 ): string | undefined {
-  const parts = [base, formatTokens(usage?.totalTokens), formatCost(usage?.totalCostUsd)].filter(
-    (part): part is string => Boolean(part),
-  );
+  const parts = [
+    base,
+    formatContext(usage?.contextUsedTokens, contextWindow),
+    formatTokens(usage?.totalTokens),
+    formatCost(usage?.totalCostUsd),
+  ].filter((part): part is string => Boolean(part));
   return parts.join(" · ") || undefined;
 }
 
 function formatTokens(totalTokens: number | undefined): string | undefined {
   if (totalTokens === undefined) return undefined;
-  if (totalTokens < 1_000) return `${Math.round(totalTokens)} tokens`;
-  return `${Math.round(totalTokens / 100) / 10}k tokens`;
+  return `${formatTokenValue(totalTokens)} tokens`;
+}
+
+function formatContext(
+  usedTokens: number | undefined,
+  maxTokens: number | undefined,
+): string | undefined {
+  if (usedTokens === undefined && maxTokens === undefined) return undefined;
+  const usage = [usedTokens, maxTokens]
+    .filter((value): value is number => value !== undefined)
+    .map(formatTokenValue)
+    .join(" / ");
+  return `${usage} context`;
+}
+
+function formatTokenValue(tokens: number): string {
+  if (tokens < 1_000) return String(Math.round(tokens));
+  if (tokens < 1_000_000) return `${Math.round(tokens / 100) / 10}k`;
+  return `${Math.round(tokens / 100_000) / 10}m`;
 }
 
 function formatCost(totalCostUsd: number | undefined): string | undefined {
@@ -590,10 +714,21 @@ function readPositiveNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
 }
 
-function sumNumbers(left: number | undefined, right: number | undefined): number | undefined {
-  if (left === undefined) return right;
-  if (right === undefined) return left;
-  return left + right;
+function readProcessId(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : undefined;
+}
+
+function piInterruptSignal(): NodeJS.Signals {
+  return process.platform === "win32" ? "SIGBREAK" : "SIGUSR2";
+}
+
+function signalPiRunner(pid: number, signal: NodeJS.Signals): void {
+  process.kill(pid, signal);
+}
+
+function sumNumbers(...values: Array<number | undefined>): number | undefined {
+  const defined = values.filter((value): value is number => value !== undefined);
+  return defined.length ? defined.reduce((total, value) => total + value, 0) : undefined;
 }
 
 function renderProgress(step: Record<string, unknown>): string {

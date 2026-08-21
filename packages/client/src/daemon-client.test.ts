@@ -1253,6 +1253,48 @@ test("lists the full agent prompt index", async () => {
   });
 });
 
+test("stops a provider subagent run", async () => {
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  const responsePromise = client.stopProviderSubagent("parent-1", "child-1", {
+    requestId: "req-stop-child-1",
+  });
+
+  expect(parseSentFrame(mock.sent[0])).toEqual({
+    type: "agent.provider_subagents.stop.request",
+    requestId: "req-stop-child-1",
+    parentAgentId: "parent-1",
+    subagentId: "child-1",
+  });
+
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "agent.provider_subagents.stop.response",
+      payload: {
+        requestId: "req-stop-child-1",
+        parentAgentId: "parent-1",
+        subagentId: "child-1",
+        error: null,
+      },
+    }),
+  );
+
+  await expect(responsePromise).resolves.toMatchObject({ error: null });
+});
+
 test("honors explicit fetchAgents timeout below the session RPC default", async () => {
   useHeartbeatClock();
   const logger = createMockLogger();

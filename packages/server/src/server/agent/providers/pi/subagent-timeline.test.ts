@@ -1,4 +1,4 @@
-import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Logger } from "pino";
@@ -25,6 +25,7 @@ describe("PiSubagentEventReader", () => {
       provider: "pi",
       emit: (event) => emitted.push(event),
       logger: { debug: vi.fn() } as unknown as Logger,
+      contextWindowForModel: () => 1_000_000,
     });
 
     writeFileSync(
@@ -99,9 +100,10 @@ describe("PiSubagentEventReader", () => {
         type: "upsert",
         id: "run-workflow:0:delegate",
         status: "completed",
+        canStop: false,
         title: "delegate",
         description: "Inspect the adapter",
-        subtitle: "gemini-3.7-flash · medium",
+        subtitle: "gemini-3.7-flash · medium · 1m context",
         cwd: "/workspace",
         timestamp: "2026-08-20T12:00:03.000Z",
       },
@@ -129,7 +131,7 @@ describe("PiSubagentEventReader", () => {
           ? [event.event.subtitle]
           : [],
       ),
-    ).toEqual(["gemini-3.7-flash · medium · 1.2k tokens · $0.0042"]);
+    ).toEqual(["gemini-3.7-flash · medium · 1.2k / 1m context · 1.2k tokens · $0.0042"]);
     expect(reader.isTerminal()).toBe(true);
     reader.close();
   });
@@ -186,6 +188,7 @@ describe("PiSubagentEventReader", () => {
       provider: "pi",
       emit: (event) => emitted.push(event),
       logger: { debug: vi.fn() } as unknown as Logger,
+      contextWindowForModel: () => 1_000_000,
     });
 
     await reader.readAvailable();
@@ -225,16 +228,130 @@ describe("PiSubagentEventReader", () => {
     ).toEqual([
       {
         id: "parallel-run:0:delegate",
-        subtitle: "gemini-3.6-flash · medium · 4.2k tokens · $0.0090",
+        subtitle: "gemini-3.6-flash · medium · 4.2k / 1m context · 4.2k tokens · $0.0090",
       },
       {
         id: "parallel-run:1:delegate",
-        subtitle: "gemini-3.6-flash · medium · 4.2k tokens · $0.0095",
+        subtitle: "gemini-3.6-flash · medium · 4.2k / 1m context · 4.2k tokens · $0.0095",
       },
       {
         id: "parallel-run:2:delegate",
-        subtitle: "gemini-3.6-flash · medium · 4.3k tokens · $0.0100",
+        subtitle: "gemini-3.6-flash · medium · 4.3k / 1m context · 4.3k tokens · $0.0100",
       },
+    ]);
+    reader.close();
+  });
+
+  test("requests a portable stop for a running async run", async () => {
+    const asyncDir = mkdtempSync(join(tmpdir(), "paseo-pi-subagent-test-"));
+    tempDirs.push(asyncDir);
+    const emitted: AgentStreamEvent[] = [];
+    const signalRunner = vi.fn();
+    writeFileSync(join(asyncDir, "events.jsonl"), "");
+    writeFileSync(
+      join(asyncDir, "status.json"),
+      JSON.stringify({
+        runId: "run-stop",
+        mode: "single",
+        state: "running",
+        agent: "delegate",
+        model: "gemini-3.7-flash",
+        pid: 42,
+      }),
+    );
+    const reader = new PiSubagentEventReader({
+      id: "run-stop",
+      asyncDir,
+      provider: "pi",
+      emit: (event) => emitted.push(event),
+      logger: { debug: vi.fn() } as unknown as Logger,
+      signalRunner,
+    });
+
+    await reader.readAvailable();
+    await reader.stop("run-stop");
+
+    expect(JSON.parse(readFileSync(join(asyncDir, "control", "stop.json"), "utf8"))).toMatchObject({
+      type: "stop",
+      source: "paseo",
+    });
+    expect(emitted.slice(-2)).toEqual([
+      {
+        type: "provider_subagent",
+        provider: "pi",
+        event: { type: "upsert", id: "run-stop", canStop: false },
+      },
+      {
+        type: "provider_subagent",
+        provider: "pi",
+        event: { type: "upsert", id: "run-stop", status: "canceled", canStop: false },
+      },
+    ]);
+    expect(signalRunner).toHaveBeenCalledWith(
+      42,
+      process.platform === "win32" ? "SIGBREAK" : "SIGUSR2",
+    );
+    reader.close();
+  });
+
+  test("keeps current context separate from cumulative billed tokens", async () => {
+    const asyncDir = mkdtempSync(join(tmpdir(), "paseo-pi-subagent-test-"));
+    tempDirs.push(asyncDir);
+    const sessionPath = join(asyncDir, "child-session.jsonl");
+    const emitted: AgentStreamEvent[] = [];
+    writeFileSync(join(asyncDir, "events.jsonl"), "");
+    writeFileSync(
+      sessionPath,
+      [
+        { totalTokens: 2_000, cost: 0.01, text: "First" },
+        { totalTokens: 3_000, cost: 0.02, text: "Second" },
+      ]
+        .map(({ totalTokens, cost, text }, index) =>
+          JSON.stringify({
+            type: "message",
+            message: {
+              role: "assistant",
+              responseId: `response-${index}`,
+              usage: { totalTokens, cost: { total: cost } },
+              content: [{ type: "text", text }],
+            },
+          }),
+        )
+        .join("\n") + "\n",
+    );
+    writeFileSync(
+      join(asyncDir, "status.json"),
+      JSON.stringify({
+        runId: "run-context",
+        mode: "single",
+        state: "complete",
+        agent: "delegate",
+        model: "gemini-3.7-flash",
+        sessionFile: sessionPath,
+      }),
+    );
+    const reader = new PiSubagentEventReader({
+      id: "run-context",
+      asyncDir,
+      provider: "pi",
+      emit: (event) => emitted.push(event),
+      logger: { debug: vi.fn() } as unknown as Logger,
+      contextWindowForModel: () => 1_000_000,
+    });
+
+    await reader.readAvailable();
+
+    expect(
+      emitted.flatMap((event) =>
+        event.type === "provider_subagent" &&
+        event.event.type === "upsert" &&
+        event.event.subtitle?.includes("tokens")
+          ? [event.event.subtitle]
+          : [],
+      ),
+    ).toEqual([
+      "gemini-3.7-flash · 2k / 1m context · 2k tokens · $0.01",
+      "gemini-3.7-flash · 3k / 1m context · 5k tokens · $0.03",
     ]);
     reader.close();
   });

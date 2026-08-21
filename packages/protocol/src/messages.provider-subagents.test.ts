@@ -36,6 +36,29 @@ describe("provider subagent protocol", () => {
     });
   });
 
+  test("accepts a scoped stop request and response", () => {
+    expect(
+      SessionInboundMessageSchema.parse({
+        type: "agent.provider_subagents.stop.request",
+        parentAgentId: "parent-1",
+        subagentId: "child-1",
+        requestId: "request-1",
+      }),
+    ).toMatchObject({ parentAgentId: "parent-1", subagentId: "child-1" });
+
+    expect(
+      SessionOutboundMessageSchema.parse({
+        type: "agent.provider_subagents.stop.response",
+        payload: {
+          parentAgentId: "parent-1",
+          subagentId: "child-1",
+          requestId: "request-1",
+          error: null,
+        },
+      }),
+    ).toMatchObject({ payload: { error: null } });
+  });
+
   test("accepts a provider child working directory while remaining compatible when absent", () => {
     const descriptor = {
       id: "child-1",
@@ -55,11 +78,11 @@ describe("provider subagent protocol", () => {
         payload: {
           requestId: "request-1",
           parentAgentId: "parent-1",
-          subagents: [{ ...descriptor, cwd: "/workspace/child" }],
+          subagents: [{ ...descriptor, cwd: "/workspace/child", canStop: true }],
           error: null,
         },
       }),
-    ).toMatchObject({ payload: { subagents: [{ cwd: "/workspace/child" }] } });
+    ).toMatchObject({ payload: { subagents: [{ cwd: "/workspace/child", canStop: true }] } });
 
     expect(
       SessionOutboundMessageSchema.parse({

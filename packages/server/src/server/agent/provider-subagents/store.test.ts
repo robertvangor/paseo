@@ -11,6 +11,7 @@ describe("ProviderSubagentStore", () => {
       title: "Explore",
       cwd: "/workspace/child",
       status: "running",
+      canStop: true,
       timestamp: "2026-07-12T10:00:00.000Z",
     });
     subagents.apply("parent-a", "codex", {
@@ -41,6 +42,7 @@ describe("ProviderSubagentStore", () => {
         title: "Explore",
         cwd: "/workspace/child",
         status: "completed",
+        canStop: false,
         createdAt: "2026-07-12T10:00:00.000Z",
         updatedAt: "2026-07-12T10:00:02.000Z",
       }),
