@@ -754,6 +754,7 @@ describe("PiRpcAgentSession", () => {
           title: "delegate",
           description: "Inspect the adapter",
           status: "running",
+          canStop: true,
           toolCallId: "launch-tool",
         },
       },
@@ -777,6 +778,87 @@ describe("PiRpcAgentSession", () => {
       },
     ]);
 
+    await session.close();
+  });
+
+  test("stops a foreground subagent by interrupting its parent turn", async () => {
+    const { pi, session, events } = await createSession();
+    const fakeSession = pi.latestSession();
+
+    await session.startTurn("delegate this");
+    fakeSession.emit({
+      type: "tool_execution_start",
+      toolCallId: "foreground-tool",
+      toolName: "subagent",
+      args: { agent: "delegate", task: "Inspect the adapter" },
+    });
+
+    await session.stopProviderSubagent("foreground-tool:0");
+
+    expect(fakeSession.abortRequested).toBe(true);
+    expect(events.providerSubagentEvents()).toContainEqual({
+      type: "provider_subagent",
+      provider: "pi",
+      event: { type: "upsert", id: "foreground-tool:0", canStop: false },
+    });
+    await session.close();
+  });
+
+  test("resolves context windows for subagent models with thinking suffixes", async () => {
+    const { pi, session, events } = await createSession();
+    const fakeSession = pi.latestSession();
+    fakeSession.models = [
+      {
+        provider: "openai-codex",
+        id: "gpt-5.6-sol",
+        contextWindow: 200_000,
+      },
+    ];
+
+    await session.startTurn("delegate this");
+    fakeSession.emit({
+      type: "tool_execution_start",
+      toolCallId: "foreground-tool",
+      toolName: "subagent",
+      args: { agent: "delegate", task: "Inspect the adapter" },
+    });
+    fakeSession.emit({
+      type: "tool_execution_end",
+      toolCallId: "foreground-tool",
+      toolName: "subagent",
+      result: {
+        details: {
+          results: [
+            {
+              index: 0,
+              agent: "delegate",
+              model: "openai-codex/gpt-5.6-sol:medium",
+              thinking: "medium",
+              messages: [
+                {
+                  role: "assistant",
+                  content: [{ type: "text", text: "Done" }],
+                  usage: { totalTokens: 1_234, cost: { total: 0.0042 } },
+                },
+              ],
+            },
+          ],
+        },
+      },
+      isError: false,
+    });
+    await waitForImmediate();
+
+    expect(events.providerSubagentEvents()).toContainEqual({
+      type: "provider_subagent",
+      provider: "pi",
+      event: {
+        type: "upsert",
+        id: "foreground-tool:0",
+        subtitle:
+          "openai-codex/gpt-5.6-sol:medium · medium · 1.2k / 200k context · 1.2k tokens · $0.0042",
+      },
+    });
     await session.close();
   });
 

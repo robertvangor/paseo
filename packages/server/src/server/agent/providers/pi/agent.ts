@@ -1312,14 +1312,19 @@ export class PiRpcAgentSession implements AgentSession {
     this.extensionTimeoutMs = options.extensionTimeoutMs ?? DEFAULT_PI_EXTENSION_RESULT_TIMEOUT_MS;
     this.logger = options.logger;
     this.indexSubagentModel(options.initialState.model ?? undefined);
-    this.foregroundSubagents = new PiForegroundSubagentIndex({ provider: this.provider });
+    this.foregroundSubagents = new PiForegroundSubagentIndex({
+      provider: this.provider,
+      emit: (event) => this.emit(event),
+      logger: this.logger,
+      parentSessionFile: () => this.state.sessionFile,
+      contextWindowForModel: (model) => this.subagentContextWindow(model),
+      onObserve: () => this.ensureSubagentModels(),
+    });
     this.subagentTimelineBridge = new PiSubagentTimelineBridge({
       provider: this.provider,
       emit: (event) => this.emit(event),
       logger: this.logger,
-      contextWindowForModel: (model) =>
-        this.subagentContextWindows.get(model) ??
-        this.subagentContextWindows.get(model.toLowerCase()),
+      contextWindowForModel: (model) => this.subagentContextWindow(model),
     });
     this.usagePoller = new PiUsagePoller({
       scheduler: options.usagePollScheduler,
@@ -1600,16 +1605,28 @@ export class PiRpcAgentSession implements AgentSession {
   }
 
   async stopProviderSubagent(subagentId: string): Promise<void> {
+    const foregroundEvents = this.foregroundSubagents.requestStop(subagentId);
+    if (foregroundEvents !== null) {
+      if (foregroundEvents.length === 0) throw new Error("Pi subagent run is no longer running");
+      for (const event of foregroundEvents) this.emit(event);
+      await this.interrupt();
+      return;
+    }
     await this.subagentTimelineBridge.stop(subagentId);
   }
 
   private observeSubagentRun(id: string, asyncDir: string): void {
     this.subagentTimelineBridge.observe(id, asyncDir);
+    this.ensureSubagentModels();
+  }
+
+  private ensureSubagentModels(): void {
     this.subagentModelsPromise ??= this.runtimeSession
       .getAvailableModels()
       .then((models) => {
         for (const model of models) this.indexSubagentModel(model);
         this.subagentTimelineBridge.refreshSubtitles();
+        this.foregroundSubagents.refreshSubtitles();
         return undefined;
       })
       .catch((error) => {
@@ -1628,6 +1645,15 @@ export class PiRpcAgentSession implements AgentSession {
     }
   }
 
+  private subagentContextWindow(model: string): number | undefined {
+    const baseModel = model.replace(/:(?:off|minimal|low|medium|high|xhigh|max)$/i, "");
+    for (const key of [model, model.toLowerCase(), baseModel, baseModel.toLowerCase()]) {
+      const contextWindow = this.subagentContextWindows.get(key);
+      if (contextWindow !== undefined) return contextWindow;
+    }
+    return undefined;
+  }
+
   async close(): Promise<void> {
     if (this.closed) {
       return;
@@ -1636,6 +1662,7 @@ export class PiRpcAgentSession implements AgentSession {
     this.usagePoller.close();
     this.subagentTimelineBridge.close();
     for (const event of this.foregroundSubagents.terminalizeRunning("canceled")) this.emit(event);
+    this.foregroundSubagents.close();
     try {
       await this.runtimeSession.close();
     } finally {

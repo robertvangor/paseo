@@ -27,7 +27,7 @@ interface PiMessageCounts {
   session: number;
 }
 
-interface PiSubagentUsage {
+export interface PiSubagentUsage {
   totalTokens?: number;
   totalCostUsd?: number;
   contextUsedTokens?: number;
@@ -560,7 +560,7 @@ export class PiSubagentTimelineBridge {
   }
 }
 
-class JsonlTail {
+export class JsonlTail {
   private decoder = new TextDecoder();
   private pendingText = "";
   private offset = 0;
@@ -634,7 +634,7 @@ function joinSubtitle(value: Record<string, unknown>): string | undefined {
   );
 }
 
-function readAssistantUsage(message: unknown): PiSubagentUsage | null {
+export function readAssistantUsage(message: unknown): PiSubagentUsage | null {
   if (!isRecord(message) || message.role !== "assistant" || !isRecord(message.usage)) return null;
   const usage = message.usage;
   const input = readPositiveNumber(usage.input);
@@ -654,7 +654,7 @@ function readAssistantUsage(message: unknown): PiSubagentUsage | null {
   };
 }
 
-function mergeUsage(
+export function mergeUsage(
   previous: PiSubagentUsage | undefined,
   increment: PiSubagentUsage,
 ): PiSubagentUsage {
@@ -668,7 +668,7 @@ function mergeUsage(
   };
 }
 
-function buildUsageSubtitle(
+export function buildUsageSubtitle(
   base: string | undefined,
   usage: PiSubagentUsage | undefined,
   contextWindow: number | undefined,
@@ -745,7 +745,7 @@ function renderProgress(step: Record<string, unknown>): string {
   return deduplicateLines(lines).join("\n");
 }
 
-function parsePiAgentMessage(value: unknown): PiAgentMessage | null {
+export function parsePiAgentMessage(value: unknown): PiAgentMessage | null {
   if (!isRecord(value) || typeof value.role !== "string") return null;
   if ((value.role === "user" || value.role === "custom") && value.content !== undefined) {
     return value as unknown as PiAgentMessage;
@@ -780,7 +780,7 @@ function resolveStepKey(event: Record<string, unknown>): string {
   return `${index}:${agent}`;
 }
 
-function eventTimestamp(event: Record<string, unknown>): string | undefined {
+export function eventTimestamp(event: Record<string, unknown>): string | undefined {
   const value = event.timestamp ?? event.observedAt ?? event.ts;
   if (typeof value === "string") {
     const timestamp = Date.parse(value);
